@@ -26,6 +26,7 @@ import json
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
@@ -44,12 +45,47 @@ PACKS_DIR = Path(__file__).parent / "packs"
 # Packs
 # ---------------------------------------------------------------------------
 
+def _merge_by(base_items: list, pack_items: list, key: str) -> list:
+    """Merge two lists of dicts by `key`: same key -> pack's fields win;
+    new keys are appended; {key: x, skip: true} removes x."""
+    merged = {item[key]: dict(item) for item in base_items}
+    for item in pack_items:
+        if item.get("skip"):
+            merged.pop(item[key], None)
+        elif item[key] in merged:
+            merged[item[key]].update(item)
+        else:
+            merged[item[key]] = dict(item)
+    return list(merged.values())
+
+
+def merge_pack(base: dict, pack: dict) -> dict:
+    """Domain pack on top of a base pack (the checks common to every person/company)."""
+    out = {**base, **{k: v for k, v in pack.items()
+                      if k not in ("inputs", "checks", "red_flags", "not_checked")}}
+    out["inputs"] = _merge_by(base.get("inputs", []), pack.get("inputs", []), "key")
+    out["checks"] = _merge_by(base.get("checks", []), pack.get("checks", []), "id")
+    out["red_flags"] = _merge_by(base.get("red_flags", []), pack.get("red_flags", []), "id")
+    out["not_checked"] = list(dict.fromkeys(base.get("not_checked", []) + pack.get("not_checked", [])))
+    return out
+
+
+def _read_yaml(path: Path) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
 def list_packs() -> dict:
-    """{pack_name: pack_dict} for every YAML file in packs/."""
+    """{pack_name: pack_dict} for every YAML file in packs/, with its bases merged in.
+    Bases live in packs/base/ and are never shown in the dropdown."""
+    bases = {p.stem: _read_yaml(p) for p in sorted((PACKS_DIR / "base").glob("*.yaml"))}
     packs = {}
     for path in sorted(PACKS_DIR.glob("*.yaml")):
-        pack = yaml.safe_load(path.read_text(encoding="utf-8"))
-        packs[pack["name"]] = pack
+        pack = _read_yaml(path)
+        extends = pack.get("extends") or []
+        merged = {}
+        for base_name in ([extends] if isinstance(extends, str) else extends):
+            merged = merge_pack(merged, bases[base_name])
+        packs[pack["name"]] = merge_pack(merged, pack)
     return packs
 
 
@@ -108,53 +144,90 @@ def resolve_params(params: dict, values: dict) -> dict:
 
 def plan(pack: dict) -> list:
     """Each step gets its tier (pack override, else registry default). Tier 1 runs first;
-    within a tier the pack's order is kept, so chained checks still work."""
+    within a tier the identity gate runs first, then the pack's order is kept."""
     steps = []
     for i, step in enumerate(pack["checks"]):
         spec = checks.CHECKS.get(step["tool"], {})
         steps.append({**step, "tier": step.get("tier", spec.get("tier", 2)), "_order": i})
-    return sorted(steps, key=lambda s: (s["tier"], s["_order"]))
+    return sorted(steps, key=lambda s: (s["tier"], not s.get("gate"), s["_order"]))
 
 
 # ---------------------------------------------------------------------------
 # Step 2: Fetch
 # ---------------------------------------------------------------------------
 
+# Checks whose results later checks reuse ({person.name}, {company.domain}...).
+# They run one at a time, in order; all other checks of the same tier run in parallel.
+PROFILE_TOOLS = {"person_profile", "company_profile", "vehicle_lookup", "nonprofit_filings"}
+PARALLEL_WORKERS = 4   # stays under Crustdata web search's 10 requests/minute
+
+
 def run_checks(pack: dict, inputs: dict) -> dict:
     """Run the planned checks. Returns results, not_checked, identity and deal_breaker."""
     values = {k: v for k, v in inputs.items() if v not in (None, "")}
-    results, not_checked = [], []
-    identity, deal_breaker = None, None
+    results, not_checked, skipped = [], [], []
+    state = {"identity": None, "deal_breaker": None}
 
-    for step in plan(pack):
+    def prepare(step):
+        """Fill params, or return None (and note why) if the check can't run."""
         spec = checks.CHECKS.get(step["tool"])
         label = step.get("label") or (spec["label"] if spec else step["tool"])
         if spec is None:
             not_checked.append({"item": label, "reason": f"Unknown tool '{step['tool']}'"})
-            continue
+            return None
         # Short-circuit: after a deal-breaker, skip the rest of the lower-tier checks.
-        if deal_breaker and step["tier"] > 1:
+        if state["deal_breaker"] and step["tier"] > 1:
             not_checked.append({"item": label, "reason": "Skipped: a Tier 1 deal-breaker was found"})
-            continue
-
+            return None
         params = resolve_params(step.get("params"), values)
         if not any(params.get(k) for k in spec["needs_any"]):
-            not_checked.append({"item": label, "reason": "Required input not provided"})
-            continue
+            skipped.append(label)          # an optional input was left blank: not a gap
+            return None
+        return spec, label, params
 
-        ev = spec["fn"](**params)
+    def record(step, label, params, ev):
+        """Store one check's evidence and what it tells later checks."""
         ev.update({"id": step["id"], "label": label, "tool": step["tool"],
-                   "tier": step["tier"], "params": params})
+                   "tier": step["tier"], "params": params, "_order": step["_order"]})
         results.append(ev)
-
         if ev["status"] == "error":
             not_checked.append({"item": label, "reason": f"Data source error: {ev['error']}"})
-        if step.get("gate") and ev.get("identity"):
-            identity = ev["identity"]                      # the identity gate
-        if ev.get("deal_breaker") and not deal_breaker:
-            deal_breaker = {"check": label, "reason": ev["deal_breaker"]}
-        # Let later checks use what this one found (e.g. the person's current company).
+        if step.get("gate") and ev.get("identity") and state["identity"] is None:
+            state["identity"] = ev["identity"]     # the identity gate (first gate that ran wins)
+        if ev.get("deal_breaker") and not state["deal_breaker"]:
+            state["deal_breaker"] = {"check": label, "reason": ev["deal_breaker"]}
+        # Let later checks use what this one found (e.g. the person's current company)...
+        # ...but only if we're reasonably sure it's the right entity. Otherwise later checks
+        # would search for a namesake; they fall back to what the user typed instead.
+        if (ev.get("identity") or {}).get("confidence") in ("low", "not_found"):
+            return
         values.update({k: v for k, v in ev["context"].items() if v})
+
+    steps = plan(pack)
+    for tier in sorted({s["tier"] for s in steps}):
+        in_tier = [s for s in steps if s["tier"] == tier]
+        # 1) Gate and profile checks, one by one (later checks need their results).
+        for step in [s for s in in_tier if s.get("gate") or s["tool"] in PROFILE_TOOLS]:
+            prepared = prepare(step)
+            if prepared:
+                spec, label, params = prepared
+                record(step, label, params, spec["fn"](**params))
+        # 2) Everything else in this tier (searches, screening) in parallel.
+        jobs = []
+        for step in [s for s in in_tier if not (s.get("gate") or s["tool"] in PROFILE_TOOLS)]:
+            prepared = prepare(step)
+            if prepared:
+                jobs.append((step, *prepared))
+        with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+            futures = [(step, label, params, pool.submit(spec["fn"], **params))
+                       for step, spec, label, params in jobs]
+            for step, label, params, future in futures:
+                record(step, label, params, future.result())
+
+    # Keep the report in plan order (tier, gate first, pack order).
+    order = {s["_order"]: i for i, s in enumerate(steps)}
+    results.sort(key=lambda ev: order[ev["_order"]])
+    identity, deal_breaker = state["identity"], state["deal_breaker"]
 
     # Give every source a short id (S1, S2, ...) that the LLM can cite.
     n = 0
@@ -162,7 +235,7 @@ def run_checks(pack: dict, inputs: dict) -> dict:
         for src in ev["sources"]:
             n += 1
             src["id"] = f"S{n}"
-    return {"results": results, "not_checked": not_checked,
+    return {"results": results, "not_checked": not_checked, "skipped": skipped,
             "identity": identity, "deal_breaker": deal_breaker}
 
 
@@ -214,6 +287,9 @@ Rules:
   fake identity); medium = needs a clarifying conversation; low = minor, worth knowing.
 - Missing data is NOT a red flag by itself. If the identity_gate says identity is low or
   not_found, mention it in the summary instead of guessing.
+- If identity_gate is low or not_found, the matched profile/record may be a DIFFERENT
+  person or company (a namesake). Do NOT compare claims against it and do NOT flag
+  anything based on it. Base flags on searches for the typed name instead.
 - CLAIMS: if subject_inputs has "claims", split them into individual facts (company, title,
   start year, duration, degree, size...) and compare EACH one to the evidence. Any
   contradiction is a red flag with rule_id "claim_mismatch" and severity at least "medium"."""
@@ -345,7 +421,8 @@ def run(pack_name: str, inputs: dict) -> dict:
 
     report = {"pack": pack["name"], "pack_label": pack["label"], "inputs": inputs,
               "checks": results, "not_checked": not_checked,
-              "identity_gate": fetched["identity"], "deal_breaker": fetched["deal_breaker"]}
+              "identity_gate": fetched["identity"], "deal_breaker": fetched["deal_breaker"],
+              "skipped": fetched["skipped"]}
 
     analyzed = analyze(_llm_payload(pack, inputs, fetched)) if results else \
         {"ok": False, "error": "No checks could run. Provide more inputs."}

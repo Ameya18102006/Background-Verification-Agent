@@ -1,0 +1,47 @@
+# Check pack: lending money / extending credit to a company (counterparty risk).
+# Insolvency, defaults and a shrinking business are what hurt a lender: all Tier 1.
+name: lending
+label: Lending to a company (credit counterparty)
+subject: company
+extends: [base_company]
+description: Before lending money, giving credit terms or a large advance to a company,
+  check for defaults, insolvency proceedings and signs the business is shrinking.
+
+inputs:
+  - {key: claims, label: "What the borrower claims (optional), e.g. 'profitable, 300 staff'", type: text}
+
+checks:
+  - id: default_news
+    label: Default and insolvency news
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}" loan default', category: default}
+        - {q: '"{company.name|company}" insolvency NCLT', category: insolvency}
+        - {q: '"{company.name|company}" salary delay', category: distress}
+  - id: regulatory
+    label: Regulator records (RBI, SEBI)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}"', site: rbi.org.in, category: regulatory}
+        - {q: '"{company.name|company}"', site: sebi.gov.in, category: regulatory}
+
+red_flags:
+  - {id: default, tier: 1, description: "Reported loan default, missed payments or wilful-defaulter listing"}
+  - {id: legal_trouble, tier: 1, description: "Insolvency (NCLT/IBC), bankruptcy or creditor lawsuits"}
+  - {id: shrinking, tier: 1, description: "Headcount dropped sharply from its peak"}
+  - {id: distress, tier: 1, description: "Salary delays, unpaid vendors, operations suspended"}
+  - {id: regulatory_action, tier: 1, description: "Regulator orders or penalties"}
+  - {id: funding_stall, tier: 2, description: "No funding for a long time while shrinking"}
+
+not_checked:
+  - Credit bureau report (CIBIL / Experian)
+  - Bank statements and GST returns
+  - Existing charges and liens on assets (MCA charge register)
+  - Collateral valuation
+
+demo:
+  company: Go First
+  domain: flygofirst.com
+  claims: Stable airline, operations running normally

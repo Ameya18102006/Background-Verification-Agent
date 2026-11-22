@@ -1,41 +1,22 @@
 # Check pack: doing a business deal with a person (co-founder, partner, investor, distributor).
+# Uses BOTH bases: the person is the subject (identity gate), their company is checked too.
 # For partnerships, links to failed ventures matter as much as legal trouble: Tier 1.
 name: business_partner
 label: Business deal with a person
 subject: person
+extends: [base_person, base_company]
 description: Before partnering, co-founding, investing with or signing a deal with an
   individual, check their track record and their company's health.
 
 inputs:
-  - {key: name, label: "Person's full name", required: true}
-  - {key: company, label: "Their company"}
-  - {key: linkedin_url, label: "LinkedIn URL (optional)"}
+  - {key: company, label: "Their company", required: false}
   - {key: domain, label: "Company website domain (optional), e.g. acme.com"}
   - {key: claims, label: "What they told you (optional)", type: text}
 
 checks:
-  - id: person
-    tool: person_profile
-    gate: true
-    params: {name: "{name}", company: "{company}", linkedin_url: "{linkedin_url}"}
-  - id: sanctions
-    tool: sanctions_screen
-    params: {names: ["{person.name|name}", "{company.name|company}"]}
-  - id: adverse_news
-    label: Fraud and insolvency news
-    tool: web_search
-    params:
-      queries:
-        - {q: '"{person.name|name}" fraud', category: adverse_media}
-        - {q: '"{company.name|company}" fraud', category: adverse_media}
-        - {q: '"{company.name|company}" insolvency', category: insolvency}
-  - id: court_records
-    label: Court records (Indian Kanoon)
-    tool: web_search
-    params:
-      queries:
-        - {q: '"{person.name|name}"', site: indiankanoon.org, category: litigation}
-        - {q: '"{company.name|company}"', site: indiankanoon.org, category: litigation}
+  # The company is secondary here: not the gate, and a Tier 2 signal.
+  - {id: company, gate: false, tier: 2, label: "Their company's status and health",
+     params: {name: "{company|person.current_company}", domain: "{domain}"}}
   - id: regulatory
     label: Regulator orders (SEBI)
     tool: web_search
@@ -43,29 +24,15 @@ checks:
       queries:
         - {q: '"{person.name|name}"', site: sebi.gov.in, category: regulatory}
         - {q: '"{company.name|company}"', site: sebi.gov.in, category: regulatory}
-  - id: their_company
-    label: Their company's status and health
-    tool: company_profile
-    params: {name: "{company|person.current_company}", domain: "{domain}"}
 
 red_flags:
-  - {id: sanctions, tier: 1, description: "Person or company matches a sanctions list"}
-  - {id: identity_unclear, tier: 1, description: "No profile found, or several people match equally"}
-  - {id: fraud_allegations, tier: 1, description: "News linking them to fraud, scams or misleading investors"}
-  - {id: legal_trouble, tier: 1, description: "Lawsuits, court judgments, insolvency or bankruptcy"}
   - {id: regulatory_action, tier: 1, description: "Regulator orders, penalties or bans (SEBI etc.)"}
   - {id: failed_ventures, tier: 1, description: "Companies they led have deleted pages, collapsed headcount or shut down"}
-  - {id: company_decline, tier: 2, description: "Their company's headcount dropped sharply from its peak"}
-  - {id: company_status, tier: 2, description: "Their company is inactive, or very new while claiming a big track record"}
-  - {id: claim_mismatch, tier: 2, description: "What they told you contradicts the evidence"}
+  - {id: shrinking, tier: 2, description: "Their company's headcount dropped sharply from its peak"}
   - {id: funding_stall, tier: 3, description: "No funding for a long time while headcount falls"}
 
 not_checked:
-  - Politically exposed person (PEP) lists
-  - Police and criminal records
   - Personal credit, debts and tax liens
-  - Company financial statements
-  - Official director and shareholding records (MCA)
 
 demo:
   name: Byju Raveendran

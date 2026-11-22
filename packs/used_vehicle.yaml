@@ -1,0 +1,57 @@
+# Check pack: buying a used vehicle (the "flood-damaged car" case).
+# No person/company base: the VIN is the subject. The VIN decode is the identity gate.
+name: used_vehicle
+label: Buying a used vehicle
+subject: vehicle
+description: Before buying a used car, check the VIN is valid, which safety recalls apply,
+  and whether the VIN shows up in salvage / damaged-car auctions (flood, accident, theft).
+
+inputs:
+  - {key: vin, label: "VIN (17 characters, on the windshield or RC)", required: true}
+  - {key: seller, label: "Seller or dealer name (optional)"}
+  - {key: claims, label: "What the seller claims (optional), e.g. 'accident-free, single owner'", type: text}
+
+checks:
+  - id: vehicle
+    tool: vehicle_lookup
+    gate: true
+    params: {vin: "{vin}"}
+  - id: salvage_auctions
+    label: Salvage and damaged-car auction listings (Copart, IAAI)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{vehicle.vin|vin}"', site: copart.com, category: salvage, reliability: record}
+        - {q: '"{vehicle.vin|vin}"', site: iaai.com, category: salvage, reliability: record}
+  - id: vin_web
+    label: Other web pages mentioning this VIN
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{vehicle.vin|vin}"', sources: web, category: vehicle_history}
+  - id: seller_news
+    label: Seller / dealer fraud news
+    tool: web_search
+    tier: 2
+    params:
+      queries:
+        - {q: '"{seller}" fraud', category: adverse_media}
+
+red_flags:
+  - {id: invalid_vin, tier: 1, description: "VIN does not decode, or decodes to a different make/model than advertised"}
+  - {id: salvage_history, tier: 1, description: "VIN listed in a salvage / insurance auction (flood, fire, collision, theft)"}
+  - {id: flood_damage, tier: 1, description: "Any listing or page describing water or flood damage"}
+  - {id: open_recall, tier: 2, description: "Serious safety recalls for this model year (check the repair was done)"}
+  - {id: claim_mismatch, tier: 1, description: "Seller's claims (accident-free, year, model) contradict the evidence"}
+  - {id: seller_fraud, tier: 2, description: "Seller or dealer linked to fraud"}
+
+not_checked:
+  - Insurance claim and accident history (paid services, e.g. Carfax / AutoCheck)
+  - Odometer readings over time (rollback check)
+  - Loan / hypothecation on the vehicle
+  - Registration and ownership records (e.g. Vahan in India)
+  - Physical inspection by a mechanic
+
+demo:
+  vin: 1HGCM82633A004352
+  claims: No safety issues, fully up to date

@@ -1,0 +1,49 @@
+# Check pack: choosing a supplier / manufacturer in your supply chain (goods, not services).
+# Adds supply-chain-specific risks on top of the company base: forced labour, recalls,
+# environmental violations. Forced labour is Tier 1 because imports can be seized.
+name: supplier
+label: Choosing a supplier (supply chain)
+subject: company
+extends: [base_company]
+description: Before sourcing goods from a manufacturer or supplier, check sanctions,
+  forced-labour and environmental issues, product recalls and the company's stability.
+
+inputs:
+  - {key: claims, label: "What the supplier claims (optional), e.g. 'ISO certified, 20 years in business'", type: text}
+
+checks:
+  - id: esg_news
+    label: Forced labour, environment and recall news
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}" forced labor', category: forced_labor}
+        - {q: '"{company.name|company}" pollution violation', category: environment}
+        - {q: '"{company.name|company}" product recall', category: recall}
+  - id: trade_enforcement
+    label: US customs and trade enforcement (CBP, DHS)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}"', site: cbp.gov, category: forced_labor, reliability: official}
+        - {q: '"{company.name|company}"', site: dhs.gov, category: forced_labor, reliability: official}
+  - id: leaders
+    label: Founders and their past ventures
+    tool: key_people
+    tier: 3
+    params: {name: "{company.name|company}", domain: "{domain|company.domain}"}
+
+red_flags:
+  - {id: forced_labor, tier: 1, description: "Forced-labour findings, Withhold Release Orders or UFLPA entity listing"}
+  - {id: environmental, tier: 2, description: "Pollution or environmental violations"}
+  - {id: product_recall, tier: 2, description: "Product recalls or safety failures"}
+  - {id: shrinking, tier: 2, description: "Headcount dropped sharply (supply continuity risk)"}
+
+not_checked:
+  - Import / export shipment records (paid trade data)
+  - ESG ratings and factory audit reports
+  - Quality certifications (ISO etc.) validity
+
+demo:
+  company: Hoshine Silicon Industry
+  claims: Ethical supplier with clean compliance record

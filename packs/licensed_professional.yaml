@@ -1,0 +1,39 @@
+# Check pack: hiring or consulting a licensed professional (doctor, lawyer, CA, architect).
+# For licensed work, disciplinary action and malpractice are Tier 1.
+name: licensed_professional
+label: Licensed professional (doctor, lawyer, CA...)
+subject: person
+extends: [base_person]
+description: Before engaging a doctor, lawyer, chartered accountant, architect or other
+  licensed professional, check for disciplinary action, malpractice and fraud.
+
+inputs:
+  - {key: profession, label: "Profession, e.g. surgeon, lawyer, chartered accountant", required: true}
+  - {key: company, label: "Hospital / firm / practice (optional)"}
+  - {key: claims, label: "What they claim (optional), e.g. '15 years experience, board certified'", type: text}
+
+checks:
+  - id: discipline_news
+    label: Disciplinary action and malpractice news
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{person.name|name}" license suspended', category: discipline}
+        - {q: '"{person.name|name}" {profession} malpractice', category: malpractice}
+        - {q: '"{person.name|name}" disciplinary {profession}', category: discipline}
+
+red_flags:
+  - {id: license_action, tier: 1, description: "License suspended, revoked, or disciplinary order by a board/council"}
+  - {id: malpractice, tier: 1, description: "Malpractice lawsuits, patient/client harm"}
+  - {id: adverse_media, tier: 1, description: "News linking them to fraud, arrest or misconduct"}
+  - {id: claim_mismatch, tier: 1, description: "Claimed experience, qualifications or employer contradict the evidence"}
+
+not_checked:
+  - Current license status at the licensing board (NMC, Bar Council, ICAI, state boards)
+  - Malpractice insurance
+  - Board certifications and original degrees
+
+demo:
+  name: Christopher Duntsch
+  profession: neurosurgeon
+  claims: Highly experienced neurosurgeon with an excellent safety record

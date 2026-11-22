@@ -1,0 +1,48 @@
+# Check pack: hiring a contractor / tradesperson (renovation, construction, repairs).
+# The business is the gate when given; otherwise the person. Customer complaints and
+# abandoned jobs are what hurt here: Tier 1 even though complaint sites are weak sources
+# (the reliability weight keeps a single complaint from dominating).
+name: contractor
+label: Hiring a contractor or tradesperson
+subject: company
+extends: [base_company, base_person]
+description: Before paying a deposit to a contractor or tradesperson, check the business
+  and owner for complaints, abandoned jobs, lawsuits and fraud.
+
+inputs:
+  - {key: company, label: "Contractor business name", required: true}
+  - {key: name, label: "Owner name (optional)", required: false}
+  - {key: claims, label: "What they claim (optional), e.g. 'licensed and insured, 10 years'", type: text}
+
+checks:
+  - {id: person, tier: 2, gate: false}     # the owner is secondary; the business is the gate
+  - id: complaints
+    label: Customer complaints and reviews
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}" complaints', sources: web, category: complaints}
+        - {q: '"{company.name|company}"', site: bbb.org, category: complaints, reliability: web}
+  - id: contractor_news
+    label: Abandoned jobs and licensing news
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}" contractor license', category: licensing}
+        - {q: '"{company.name|company}" homeowners lawsuit', category: litigation}
+
+red_flags:
+  - {id: complaints, tier: 1, description: "Pattern of customer complaints: deposits taken, jobs abandoned, poor work"}
+  - {id: licensing, tier: 1, description: "Working without a required license, or license action"}
+  - {id: legal_trouble, tier: 1, description: "Lawsuits by customers or regulators"}
+  - {id: very_new, tier: 2, description: "Business is very new or cannot be found"}
+
+not_checked:
+  - Contractor license status at the licensing authority
+  - Insurance and bonding certificates
+  - Permits pulled for past jobs
+
+demo:
+  company: Power Home Remodeling
+  domain: powerhrg.com
+  claims: Thousands of happy customers, no complaints

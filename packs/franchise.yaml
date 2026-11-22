@@ -1,0 +1,45 @@
+# Check pack: buying a franchise (checking the franchisor company).
+# What hurts a franchisee: franchisor disputes with franchisees, misleading earnings
+# claims, a shrinking brand. Franchisee lawsuits are Tier 1.
+name: franchise
+label: Buying a franchise
+subject: company
+extends: [base_company]
+description: Before paying a franchise fee, check the franchisor for disputes with existing
+  franchisees, misleading earnings claims, regulator action and a shrinking brand.
+
+inputs:
+  - {key: company, label: "Franchisor / brand name", required: true}
+  - {key: claims, label: "What the franchisor promises (optional), e.g. 'ROI in 18 months, 500 outlets'", type: text}
+
+checks:
+  - id: franchisee_disputes
+    label: Franchisee disputes and complaints
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}" franchisee lawsuit', category: franchisee_disputes}
+        - {q: '"{company.name|company}" franchise outlets closing', category: decline}
+  - id: regulatory
+    label: Regulator actions (US FTC)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}" franchise', site: ftc.gov, category: regulatory, reliability: official}
+
+red_flags:
+  - {id: franchisee_disputes, tier: 1, description: "Lawsuits or organised complaints by franchisees"}
+  - {id: misleading_earnings, tier: 1, description: "Allegations of misleading earnings or ROI claims"}
+  - {id: regulatory_action, tier: 1, description: "Regulator action on franchise sales practices"}
+  - {id: outlet_closures, tier: 2, description: "Many outlets closing, or brand shrinking"}
+  - {id: shrinking, tier: 2, description: "Franchisor headcount dropped sharply"}
+
+not_checked:
+  - Franchise Disclosure Document (FDD) and agreement terms
+  - Unit economics of existing outlets
+  - Conversations with current and former franchisees
+
+demo:
+  company: Subway
+  domain: subway.com
+  claims: Franchisees are happy and outlets are growing

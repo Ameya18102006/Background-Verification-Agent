@@ -119,6 +119,8 @@ st.subheader("Not checked")
 st.caption("We never guess. These were not covered by this pre-screen:")
 for n in report["not_checked"]:
     st.markdown(f"- **{n['item']}**: {n['reason']}")
+if report.get("skipped"):
+    st.caption("Not run because an optional input was left blank: " + ", ".join(report["skipped"]))
 
 # --- Evidence, grouped by tier --------------------------------------------
 st.subheader("Evidence")
