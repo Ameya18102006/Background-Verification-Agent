@@ -1,0 +1,45 @@
+# Check pack: donating to a nonprofit / charity.
+# The IRS filing record (US) is the identity gate; the company base adds sanctions,
+# misuse-of-funds news and court records.
+name: nonprofit
+label: Donating to a nonprofit or charity
+subject: organization
+extends: [base_company]
+description: Before donating, check the charity is a registered tax-exempt organization,
+  files its returns, spends sensibly, and is not linked to misuse of funds or sanctions.
+
+inputs:
+  - {key: company, label: "Charity / nonprofit name", required: true}
+  - {key: ein, label: "US EIN (optional, exact match), e.g. 20-2370934"}
+
+checks:
+  - id: filings
+    tool: nonprofit_filings
+    gate: true
+    params: {name: "{company}", ein: "{ein}"}
+  # The LinkedIn-style company record is secondary for a charity.
+  - {id: company, gate: false, tier: 2}
+  - id: misuse_news
+    label: Misuse of funds news
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{org.name|company}" misuse of funds', category: misuse}
+        - {q: '"{org.name|company}" lavish spending', category: misuse}
+
+red_flags:
+  - {id: not_registered, tier: 1, description: "Not found as a tax-exempt organization, or exemption revoked"}
+  - {id: misuse_of_funds, tier: 1, description: "Reports of misusing donations, lavish spending or fraud"}
+  - {id: no_recent_filings, tier: 1, description: "No IRS filing in the last 3 years"}
+  - {id: high_fundraising_cost, tier: 2, description: "Fundraising costs above ~35% of expenses"}
+  - {id: high_officer_pay, tier: 2, description: "Officer compensation is a large share of expenses"}
+  - {id: repeated_deficits, tier: 3, description: "Expenses above revenue in most recent years"}
+
+not_checked:
+  - Charity ratings (Charity Navigator, GuideStar / Candid)
+  - Audited financial statements and program outcomes
+  - Indian registrations (12A, 80G, FCRA)
+
+demo:
+  company: Wounded Warrior Project
+  ein: "202370934"

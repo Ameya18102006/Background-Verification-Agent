@@ -8,6 +8,32 @@ links to its source. It replaces the first step of a paid background check, whic
 Anything we can't check (police records, tax liens, financial statements, ...) is listed
 under **Not checked**. The agent never guesses.
 
+## Domains (13 packs)
+
+| Pack | Subject | Domain-specific checks (on top of the common base checks) |
+|---|---|---|
+| `hiring` | person | Claims vs. profile, job hopping, gaps, employer profile |
+| `business_partner` | person + company | Their company's health, failed ventures, SEBI orders |
+| `vendor` | company | Regulator actions, founders' past ventures |
+| `investment` | company + founder | Governance/irregularity news, layoffs, SEC/SEBI, founders' ventures |
+| `lending` | company | Loan default, NCLT insolvency, salary delays, RBI/SEBI |
+| `real_estate` | property + developer + owner | Possession delays, RERA complaints, demolition/illegal construction, property court cases |
+| `used_vehicle` | vehicle (VIN) | NHTSA VIN decode + safety recalls, salvage auction listings (Copart, IAAI) |
+| `supplier` | company | Forced labour, pollution, recalls, US CBP/DHS enforcement |
+| `franchise` | franchisor company | Franchisee lawsuits, outlet closures, FTC actions |
+| `licensed_professional` | person | License suspension, malpractice, disciplinary news |
+| `contractor` | business + owner | Customer complaints (BBB), licensing, homeowner lawsuits |
+| `marketplace_seller` | shop + owner | Scam reports, Trustpilot / consumer complaints, FTC actions |
+| `nonprofit` | organization | IRS tax-exempt status and Form 990 filings (ProPublica), misuse-of-funds news |
+
+**Common checks** live in `packs/base/`:
+- `base_person`: identity, sanctions, fraud news and court records.
+- `base_company`: company identity, status and health, sanctions, fraud/lawsuit/bankruptcy news and court records.
+
+A domain pack says `extends: [base_company]` (or both bases) and only adds what is specific
+to it. It can also change or remove a base check by repeating its id, e.g.
+`{id: company, gate: false, tier: 2}` or `{id: company_courts, skip: true}`.
+
 ## What it checks, by tier
 
 | Tier | Check | Data source | Source reliability |
@@ -20,6 +46,12 @@ under **Not checked**. The agent never guesses.
 | 1–2 | Company status and age, headcount drop from peak | Crustdata company enrich | record |
 | 2 | Founders' past ventures ("phoenix" pattern) | Crustdata company people + person search | record |
 | 2 | Claims vs. records (jobs, titles, years, education) | Crustdata person profile | record |
+| 1 | Vehicle identity and safety recalls | US NHTSA vPIC + recalls API (free) | official |
+| 1 | Nonprofit tax-exempt status and filings | ProPublica Nonprofit Explorer, IRS 990 data (free) | official |
+
+Within a tier, the identity gate and profile checks run first, one by one, because later
+checks reuse what they find. All other checks in that tier run in parallel, 4 at a time,
+to stay under Crustdata's 10 web searches per minute.
 
 ## How it works
 
@@ -55,7 +87,8 @@ Pack (YAML) ─> Plan ─────────> Fetch ───────�
 | `tools.py` | Thin Crustdata wrappers with disk caching |
 | `update_sanctions.py` | Downloads the OFAC lists into `data/sanctions/` |
 | `config.py` | API keys (git-ignored) |
-| `packs/*.yaml` | `hiring`, `business_partner`, `vendor` |
+| `packs/base/*.yaml` | Common checks for every person / company |
+| `packs/*.yaml` | 13 domain packs (see table above) |
 
 ## Adding a new domain
 
@@ -89,10 +122,17 @@ streamlit run app.py
 Pick a pack, click **Load demo case**, tick the consent box, then click **Run pre-screen**.
 CLI version: `python agent.py vendor` (or `hiring`, `business_partner`).
 
-Demo cases (public figures and companies, already cached):
+Every pack has a **Load demo case** button. The demos use public figures, companies and a
+standard sample VIN, and are already cached, so they run instantly and cost no credits. Examples:
 - **Business partner:** Byju Raveendran / BYJU'S → High (fraud, insolvency, jail sentence, headcount down 46%)
 - **Vendor:** Builder.ai → High (bankruptcy, fraud allegations, Indian Kanoon court records)
+- **Investment:** GoMechanic → High (admitted financial-reporting errors, FIR, headcount down 70%)
+- **Lending:** Go First → High (insolvency, defaults, liquidation)
+- **Used vehicle:** sample VIN 1HGCM82633A004352 → official NHTSA airbag recalls contradict "no safety issues"
+- **Nonprofit:** Wounded Warrior Project → registered 501(c)(3), but lavish-spending news and a 2023 deficit
 - **Hiring:** Satya Nadella with a false claim ("CEO since 2010") → claim mismatch flagged
+
+A first, uncached run takes about 1–3 minutes, because live web search is the slow part.
 
 ## Credits (approximate)
 
@@ -103,6 +143,7 @@ Demo cases (public figures and companies, already cached):
 | `/company/enrich` people (founders, CXOs) | ~6 |
 | `/web/search/live` (per query) | 1 |
 | Sanctions screening | 0 (local files) |
+| NHTSA, ProPublica | 0 (free public APIs) |
 
 One full run costs about 5–15 credits. Repeating a query costs 0, because every API
 response and LLM answer is cached in `cache/`.

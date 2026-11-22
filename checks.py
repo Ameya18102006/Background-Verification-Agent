@@ -444,9 +444,11 @@ def sanctions_screen(names: list) -> dict:
 
 def web_search(queries: list, results_per_query: int = 5) -> dict:
     """
-    queries: list of strings, or dicts {"q": ..., "category": ..., "site": ...}.
+    queries: list of strings, or dicts {"q", "category", "site", "reliability", "sources"}.
     "site" restricts to one website (e.g. indiankanoon.org for court judgments);
-    results from OFFICIAL_SITES are marked as official records.
+    results from OFFICIAL_SITES are marked as official records unless the pack sets
+    "reliability" itself (e.g. "record" for a salvage-auction listing of a VIN).
+    "sources" picks news or web results (default: news, or web when a site is given).
     """
     sources, per_query, credits, errors, all_cached = [], {}, 0.0, [], True
     for item in queries:
@@ -455,7 +457,8 @@ def web_search(queries: list, results_per_query: int = 5) -> dict:
         if not q:
             continue
         category = spec.get("category", "adverse_media")
-        result = tools.web_search(q, ["web"] if site else ["news"], site=site)
+        kinds = spec.get("sources") or (["web"] if site else ["news"])
+        result = tools.web_search(q, kinds if isinstance(kinds, list) else [kinds], site=site)
         label = f"{q} [site:{site}]" if site else q
         if not result["ok"]:
             errors.append(result["error"])
@@ -470,7 +473,8 @@ def web_search(queries: list, results_per_query: int = 5) -> dict:
             hits = [h for h in hits if _host(h.get("url")).endswith(site)]
         hits = hits[:results_per_query]
         per_query[label] = len(hits)
-        reliability = "official" if site in OFFICIAL_SITES else ("web" if site else "news")
+        reliability = spec.get("reliability") or (
+            "official" if site in OFFICIAL_SITES else ("web" if site else "news"))
         for h in hits:
             sources.append({"title": h.get("title"), "url": h.get("url"),
                             "snippet": h.get("snippet") or "", "category": category,
@@ -532,6 +536,111 @@ def key_people(name: str = "", domain: str = "", max_people: int = 2) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Check: vehicle_lookup  (US NHTSA: decode VIN + open safety recalls; free, official)
+# ---------------------------------------------------------------------------
+
+def vehicle_lookup(vin: str) -> dict:
+    """Decode the VIN (is it a real, valid VIN? which car?) and list safety recalls."""
+    vin = re.sub(r"[^A-Za-z0-9]", "", vin or "").upper()
+    if len(vin) != 17:
+        return _evidence("empty", facts={"vin": vin, "result": "VIN must be 17 characters"},
+                         identity={"confidence": "not_found", "reasons": ["Invalid VIN length"]})
+    result = tools.nhtsa_decode_vin(vin)
+    if not result["ok"]:
+        return _evidence("error", result=result, error=result["error"])
+    v = (result["data"] or {}).get("Results", [{}])[0]
+    make, model, year = v.get("Make"), v.get("Model"), v.get("ModelYear")
+    clean = str(v.get("ErrorCode", "")).startswith("0")
+    decode_url = f"https://vpic.nhtsa.dot.gov/decoder/Decoder?VIN={vin}"
+    sources = [{"title": f"NHTSA VIN decode: {year} {make} {model}", "url": decode_url,
+                "snippet": v.get("ErrorText", ""), "reliability": "official"}]
+
+    recalls = []
+    if make and model and year:
+        rec = tools.nhtsa_recalls(make, model, year)
+        for r in ((rec.get("data") or {}).get("results") or [])[:8] if rec["ok"] else []:
+            recalls.append({"campaign": r.get("NHTSACampaignNumber"), "component": r.get("Component"),
+                            "date": r.get("ReportReceivedDate"), "park_it": r.get("parkIt")})
+            sources.append({"title": f"NHTSA recall {r.get('NHTSACampaignNumber')}: {r.get('Component')}",
+                            "url": f"https://www.nhtsa.gov/recalls?nhtsaId={r.get('NHTSACampaignNumber')}",
+                            "snippet": (r.get("Summary") or "")[:200], "reliability": "official"})
+
+    facts = {"vin": vin, "decoded_ok": clean, "decode_message": v.get("ErrorText"),
+             "make": make, "model": model, "year": year, "body": v.get("BodyClass"),
+             "plant_country": v.get("PlantCountry"), "recalls_for_this_model_year": recalls,
+             "note": "Recalls apply to the model year; check whether this car's repair was done."}
+    identity = {"confidence": "high" if clean and make else "low",
+                "reasons": [v.get("ErrorText") or "VIN not decoded"]}
+    context = {"vehicle.vin": vin, "vehicle.make": make, "vehicle.model": model, "vehicle.year": year}
+    return _evidence("ok" if make else "empty", facts, sources, context, result, identity=identity)
+
+
+# ---------------------------------------------------------------------------
+# Check: nonprofit_filings  (US IRS Form 990 data via ProPublica; free, official)
+# ---------------------------------------------------------------------------
+
+def nonprofit_filings(name: str = "", ein: str = "") -> dict:
+    """Tax-exempt status and the last few years of IRS filings for a US nonprofit."""
+    ein = re.sub(r"\D", "", ein or "")
+    by_ein, candidates = bool(ein), 1
+    if not ein:
+        found = tools.propublica_search(name)
+        if not found["ok"]:
+            return _evidence("error", result=found, error=found["error"])
+        orgs = (found["data"] or {}).get("organizations") or []
+        orgs.sort(key=lambda o: -name_similarity(name, o.get("name", "")))
+        if not orgs:
+            return _evidence("empty", facts={"searched_for": name, "result": "not found in IRS data"},
+                             identity={"confidence": "not_found",
+                                       "reasons": ["No US nonprofit with this name in IRS data"]})
+        ein, candidates = str(orgs[0]["ein"]), len(orgs)
+
+    result = tools.propublica_org(ein)
+    if not result["ok"]:
+        return _evidence("error", result=result, error=result["error"])
+    if not result["data"]:
+        return _evidence("empty", facts={"ein": ein, "result": "EIN not found"},
+                         identity={"confidence": "not_found", "reasons": ["EIN not found"]})
+    org = result["data"]["organization"]
+    filings = []
+    for f in (result["data"].get("filings_with_data") or [])[:4]:
+        exp = f.get("totfuncexpns") or 0
+        filings.append({
+            "year": f.get("tax_prd_yr"), "revenue": f.get("totrevenue"), "expenses": exp,
+            "deficit": (f.get("totrevenue") or 0) < exp,
+            "fundraising_cost_pct": round(100 * (f.get("profndraising") or 0) / exp, 1) if exp else None,
+            "officer_pay_pct": round(100 * (f.get("pct_compnsatncurrofcr") or 0), 1),
+            "net_assets": f.get("totnetassetend"), "pdf": f.get("pdf_url")})
+    last_year = filings[0]["year"] if filings else None
+
+    facts = {"name": org.get("name"), "ein": ein, "city": org.get("city"), "state": org.get("state"),
+             "tax_exempt_section": f"501(c)({org.get('subsection_code')})",
+             "deductible_donations": org.get("deductibility_code") == 1,
+             "exempt_since": org.get("ruling_date"),
+             "latest_filing_year": last_year,
+             "years_since_last_filing": date.today().year - last_year if last_year else None,
+             "filings": filings,
+             "note": "US organizations only. No filings can mean small size or non-compliance."}
+    page = f"https://projects.propublica.org/nonprofits/organizations/{ein}"
+    sources = [{"title": f"IRS nonprofit record: {org.get('name')} (EIN {ein})", "url": page,
+                "snippet": f"{facts['tax_exempt_section']}, exempt since {org.get('ruling_date')}",
+                "reliability": "official"}]
+    sources += [{"title": f"IRS Form 990, {f['year']}", "url": f["pdf"] or page,
+                 "snippet": f"Revenue {f['revenue']}, expenses {f['expenses']}",
+                 "reliability": "official"} for f in filings[:2]]
+
+    sim = name_similarity(name, org.get("name", "")) if name else 0.0
+    if by_ein:                                   # an EIN is an exact identifier
+        conf, reasons = "high", [f"Matched by EIN {ein}"]
+    else:
+        conf = "high" if sim >= 0.85 and candidates == 1 else ("medium" if sim >= 0.85 else "low")
+        reasons = [f"Name similarity {sim:.0%} with '{org.get('name')}'",
+                   f"{candidates} nonprofits matched the name"]
+    return _evidence("ok", facts, sources, {"org.name": org.get("name"), "org.ein": ein}, result,
+                     identity={"confidence": conf, "reasons": reasons})
+
+
+# ---------------------------------------------------------------------------
 # The registry: tool name used in YAML packs -> function and defaults.
 #   needs_any : at least one of these params must be filled, else the check is skipped
 #   tier      : default tier (1 = deal-breaker checks, run first). Packs can override.
@@ -548,4 +657,8 @@ CHECKS = {
                          "label": "Web and news search"},
     "key_people":       {"fn": key_people, "needs_any": ["name", "domain"], "tier": 2,
                          "label": "Founders and their past ventures"},
+    "vehicle_lookup":   {"fn": vehicle_lookup, "needs_any": ["vin"], "tier": 1,
+                         "label": "Vehicle identity and safety recalls (NHTSA)"},
+    "nonprofit_filings": {"fn": nonprofit_filings, "needs_any": ["name", "ein"], "tier": 1,
+                          "label": "Tax-exempt status and IRS filings"},
 }

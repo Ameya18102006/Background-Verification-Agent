@@ -1,0 +1,44 @@
+# BASE PACK: the common checks run for EVERY person, whatever the domain.
+# Domain packs use `extends: [base_person]` and then:
+#   - add their own checks / red flags / inputs (new ids or keys)
+#   - change a base item by repeating its id/key with new fields, e.g. {id: person, tier: 2}
+#   - remove a base item with {id: ..., skip: true}
+# Bases are not shown in the dropdown.
+
+inputs:
+  - {key: name, label: "Person's full name", required: true}
+  - {key: linkedin_url, label: "LinkedIn URL (optional, most accurate)"}
+
+checks:
+  - id: person
+    tool: person_profile
+    gate: true
+    params: {name: "{name}", company: "{company}", linkedin_url: "{linkedin_url}"}
+  - id: person_sanctions
+    tool: sanctions_screen
+    label: Sanctions screening (person)
+    params: {names: ["{person.name|name}"]}
+  - id: person_news
+    label: Fraud and misconduct news (person)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{person.name|name}" fraud', category: adverse_media}
+        - {q: '"{person.name|name}" arrested', category: adverse_media}
+  - id: person_courts
+    label: Court records (person, Indian Kanoon)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{person.name|name}"', site: indiankanoon.org, category: litigation}
+
+red_flags:
+  - {id: sanctions, tier: 1, description: "Name matches a sanctions list"}
+  - {id: identity_unclear, tier: 1, description: "No profile found, or several people match equally"}
+  - {id: adverse_media, tier: 1, description: "News linking the person to fraud, arrest or misconduct"}
+  - {id: litigation, tier: 1, description: "Court judgment naming the person as accused or defendant"}
+  - {id: claim_mismatch, tier: 2, description: "What they claim contradicts the evidence"}
+
+not_checked:
+  - Politically exposed person (PEP) lists
+  - Police and criminal records

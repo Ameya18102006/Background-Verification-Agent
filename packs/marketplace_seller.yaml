@@ -1,0 +1,48 @@
+# Check pack: buying from an online seller / shop, or hiring a freelancer through a platform.
+# Scam reports are Tier 1, but they usually come from forums and review sites (weak
+# sources), so the score keeps one angry post from outranking an official record.
+name: marketplace_seller
+label: Online seller or freelancer
+subject: company
+extends: [base_company, base_person]
+description: Before paying an online shop, marketplace seller or freelancer, check for scam
+  reports, consumer complaints, fake-review findings and regulator action.
+
+inputs:
+  - {key: company, label: "Shop / seller / brand name", required: true}
+  - {key: name, label: "Freelancer or owner name (optional)", required: false}
+  - {key: claims, label: "What they claim (optional), e.g. '10,000 happy customers, 5-star rated'", type: text}
+
+checks:
+  - {id: person, tier: 2, gate: false}     # the owner is secondary; the shop is the gate
+  - id: scam_reports
+    label: Scam reports and consumer complaints
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}" scam', sources: web, category: scam_reports}
+        - {q: '"{company.name|company}"', site: trustpilot.com, category: reviews, reliability: web}
+        - {q: '"{company.name|company}"', site: consumercomplaints.in, category: complaints, reliability: web}
+  - id: regulatory
+    label: Consumer-protection actions (US FTC)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}"', site: ftc.gov, category: regulatory, reliability: official}
+
+red_flags:
+  - {id: scam_reports, tier: 1, description: "Repeated reports of non-delivery, fake products or payment scams"}
+  - {id: fake_reviews, tier: 1, description: "Findings of fake or suppressed reviews"}
+  - {id: regulatory_action, tier: 1, description: "Consumer-protection regulator action or fine"}
+  - {id: very_new, tier: 2, description: "Shop is very new while claiming a big customer base"}
+  - {id: complaints, tier: 2, description: "Many unresolved consumer complaints"}
+
+not_checked:
+  - Seller rating history on the marketplace platform
+  - Payment disputes and chargebacks
+  - Business registration and GST status
+
+demo:
+  company: Fashion Nova
+  domain: fashionnova.com
+  claims: All our reviews are genuine

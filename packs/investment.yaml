@@ -1,0 +1,57 @@
+# Check pack: investing in a startup / private company (due diligence pre-screen).
+# Company is the subject (gate); the founder is checked too. Governance and founder
+# track record are Tier 1 for investors.
+name: investment
+label: Investing in a company (due diligence)
+subject: company
+extends: [base_company, base_person]
+description: Before investing in a startup or private company, check that the company is
+  real and growing, the founders have a clean record, and there are no governance red flags.
+
+inputs:
+  - {key: company, label: "Company name", required: true}
+  - {key: name, label: "Founder / CEO name (optional)", required: false}
+  - {key: claims, label: "What the pitch claims (optional), e.g. '200 employees, 3x growth, raised $10M'", type: text}
+
+checks:
+  # The founder is secondary here (Tier 2); the company is the identity gate.
+  - {id: person, gate: false, tier: 2, params: {name: "{name}", company: "{company.name|company}"}}
+  - id: governance_news
+    label: Governance and financial-irregularity news
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}" financial irregularities', category: governance}
+        - {q: '"{company.name|company}" layoffs', category: decline}
+  - id: regulatory
+    label: Regulator actions (SEBI, US SEC)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}"', site: sebi.gov.in, category: regulatory}
+        - {q: '"{company.name|company}"', site: sec.gov, category: regulatory}
+  - id: leaders
+    label: Founders and their past ventures
+    tool: key_people
+    params: {name: "{company.name|company}", domain: "{domain|company.domain}"}
+
+red_flags:
+  - {id: governance, tier: 1, description: "Financial misreporting, auditor resignation, fake revenue or related-party issues"}
+  - {id: regulatory_action, tier: 1, description: "Regulator orders, penalties or investigations"}
+  - {id: founder_track_record, tier: 1, description: "Founder linked to fraud, or led companies that collapsed"}
+  - {id: shrinking, tier: 1, description: "Headcount dropped sharply from its peak (often precedes a down round)"}
+  - {id: claim_mismatch, tier: 1, description: "Pitch claims (headcount, growth, funding) contradict the evidence"}
+  - {id: funding_stall, tier: 2, description: "No new funding for a long time while burning cash or shrinking"}
+  - {id: layoffs, tier: 2, description: "Recent layoffs reported in the news"}
+
+not_checked:
+  - Audited financial statements and revenue
+  - Cap table and shareholder agreements
+  - Intellectual property ownership
+  - Customer references and contracts
+
+demo:
+  company: GoMechanic
+  domain: gomechanic.in
+  name: Amit Bhasin
+  claims: Fast-growing, financially sound company

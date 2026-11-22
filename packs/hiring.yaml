@@ -1,60 +1,36 @@
 # Check pack: hiring a candidate.
+# Common person checks (identity, sanctions, fraud news, court records) come from
+# packs/base/base_person.yaml. This file only adds what is specific to hiring.
+#
 # Placeholders: {input_key} from the form, {a|b} = first non-empty,
 # {person.name}, {person.current_company}, {company.name} = found by an earlier check.
 # tier: 1 = deal-breaker checks (run first), 2 = high-value signals, 3 = minor.
-# gate: true = this check confirms identity; everything else depends on it.
 name: hiring
 label: Hiring a candidate
 subject: person
+extends: [base_person]
 description: Pre-screen a job candidate before an offer. Find their real professional
   history and point out anything worth asking about in the interview.
 
 inputs:
   - {key: name, label: "Candidate full name", required: true}
   - {key: company, label: "Current or last employer"}
-  - {key: linkedin_url, label: "LinkedIn URL (optional, most accurate)"}
   - {key: claims, label: "What the candidate claims (optional), e.g. 'Senior Data Scientist at X, 4 years, B.Tech IIT Delhi'", type: text}
 
 checks:
-  - id: candidate
-    tool: person_profile
-    gate: true
-    params: {name: "{name}", company: "{company}", linkedin_url: "{linkedin_url}"}
-  - id: sanctions
-    tool: sanctions_screen
-    params: {names: ["{person.name|name}"]}
-  - id: adverse_news
-    label: Fraud and misconduct news
-    tool: web_search
-    params:
-      queries:
-        - {q: '"{person.name|name}" fraud', category: adverse_media}
-        - {q: '"{person.name|name}" arrested', category: adverse_media}
-  - id: court_records
-    label: Court records (Indian Kanoon)
-    tool: web_search
-    params:
-      queries:
-        - {q: '"{person.name|name}"', site: indiankanoon.org, category: litigation}
   - id: employer
     label: Current employer profile
     tool: company_profile
+    tier: 2
     params: {name: "{person.current_company|company}"}
 
-# tier here = how much this kind of flag weighs in the risk score for THIS domain.
 red_flags:
-  - {id: sanctions, tier: 1, description: "Name matches a sanctions list"}
-  - {id: identity_unclear, tier: 1, description: "No profile found, or several people match equally"}
   - {id: claim_mismatch, tier: 1, description: "Claimed company, title, years or degree differ from the profile"}
-  - {id: adverse_media, tier: 1, description: "News linking the person to fraud, harassment, arrest or misconduct"}
-  - {id: litigation, tier: 1, description: "Court judgment naming the person as accused or defendant"}
   - {id: shell_employer, tier: 2, description: "A claimed employer is tiny, deleted, very new or cannot be found"}
   - {id: job_hopping, tier: 3, description: "Several jobs shorter than one year"}
   - {id: unexplained_gap, tier: 3, description: "Employment gap over 6 months"}
 
 not_checked:
-  - Politically exposed person (PEP) lists
-  - Police and criminal records
   - Professional license status
   - Original education certificates
   - Reference calls with past managers

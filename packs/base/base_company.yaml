@@ -1,0 +1,46 @@
+# BASE PACK: the common checks run for EVERY company / organization, whatever the domain.
+# Domain packs use `extends: [base_company]` (or both bases) and add or override items
+# by id (see base_person.yaml for the rules). Bases are not shown in the dropdown.
+
+inputs:
+  - {key: company, label: "Company name", required: true}
+  - {key: domain, label: "Website domain (most accurate), e.g. acme.com"}
+
+checks:
+  - id: company
+    tool: company_profile
+    tier: 1
+    gate: true
+    params: {name: "{company}", domain: "{domain}"}
+  - id: company_sanctions
+    tool: sanctions_screen
+    label: Sanctions screening (company)
+    params: {names: ["{company.name|company}", "{company}"]}
+  - id: company_news
+    label: Fraud, lawsuit and bankruptcy news (company)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}" fraud', category: adverse_media}
+        - {q: '"{company.name|company}" lawsuit', category: litigation}
+        - {q: '"{company.name|company}" bankruptcy', category: insolvency}
+  - id: company_courts
+    label: Court records (company, Indian Kanoon)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}"', site: indiankanoon.org, category: litigation}
+
+red_flags:
+  - {id: sanctions, tier: 1, description: "Company matches a sanctions list"}
+  - {id: not_found, tier: 1, description: "No company record found, or a different company matches"}
+  - {id: inactive, tier: 1, description: "Company status is closed, acquired, dissolved or inactive"}
+  - {id: fraud_allegations, tier: 1, description: "News of fraud or misleading customers or investors"}
+  - {id: legal_trouble, tier: 1, description: "Lawsuits, court judgments, insolvency or bankruptcy"}
+  - {id: shrinking, tier: 2, description: "Headcount dropped sharply from its peak"}
+  - {id: very_new, tier: 2, description: "Founded under 2 years ago while claiming a long track record"}
+  - {id: claim_mismatch, tier: 2, description: "Their claims (size, age, stability, clients) contradict the evidence"}
+
+not_checked:
+  - Financial statements and credit rating
+  - Official director and shareholding records (MCA / Companies House)

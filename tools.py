@@ -10,6 +10,7 @@ All functions return a dict and never raise:
 
 import hashlib
 import json
+import time
 from pathlib import Path
 
 import requests
@@ -68,11 +69,16 @@ def crustdata_post(endpoint: str, body: dict) -> dict:
 
     if not config.CRUSTDATA_API_KEY:
         return {"ok": False, "error": "CRUSTDATA_API_KEY is empty. Add it to config.py."}
-    try:
-        resp = requests.post(BASE_URL + endpoint, headers=_headers(), json=body,
-                             timeout=TIMEOUT_SECONDS)
-    except requests.RequestException as e:
-        return {"ok": False, "error": f"Network error calling {endpoint}: {e}"}
+    for attempt in range(4):
+        try:
+            resp = requests.post(BASE_URL + endpoint, headers=_headers(), json=body,
+                                 timeout=TIMEOUT_SECONDS)
+        except requests.RequestException as e:
+            return {"ok": False, "error": f"Network error calling {endpoint}: {e}"}
+        if resp.status_code != 429:
+            break
+        # 429 = rate limit (e.g. web search allows 10/minute): wait, then try again.
+        time.sleep(15 * (attempt + 1))
 
     if resp.status_code != 200:
         # Errors are NOT cached: a retry later might succeed.
@@ -148,6 +154,51 @@ def web_search(query: str, sources=("news",), site: str = None) -> dict:
     if site:
         body["site"] = site
     return crustdata_post("/web/search/live", body)
+
+
+# ---------------------------------------------------------------------------
+# Free official public APIs (no key, no credits). Cached the same way.
+# ---------------------------------------------------------------------------
+
+def cached_get(url: str, params: dict = None, timeout: int = 45) -> dict:
+    """GET a public JSON API with disk caching. Same return shape as crustdata_post."""
+    key = cache_key("get_" + url.split("//")[-1].split("/")[0], {"url": url, "params": params})
+    cached = read_cache(key)
+    if cached is not None:
+        return {**cached, "from_cache": True}
+    try:
+        resp = requests.get(url, params=params, timeout=timeout)
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"Network error calling {url}: {e}"}
+    if resp.status_code == 404:
+        return {"ok": True, "data": None, "from_cache": False}   # "not found" is an answer
+    if resp.status_code != 200:
+        return {"ok": False, "error": f"{url} returned {resp.status_code}: {resp.text[:200]}"}
+    result = {"ok": True, "data": resp.json()}
+    write_cache(key, result)
+    return {**result, "from_cache": False}
+
+
+def nhtsa_decode_vin(vin: str) -> dict:
+    """US NHTSA vPIC: decode a VIN into make, model, year (free, official)."""
+    return cached_get(f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{vin}",
+                      {"format": "json"})
+
+
+def nhtsa_recalls(make: str, model: str, year: str) -> dict:
+    """US NHTSA: safety recalls for a make/model/year (free, official)."""
+    return cached_get("https://api.nhtsa.gov/recalls/recallsByVehicle",
+                      {"make": make, "model": model, "modelYear": year})
+
+
+def propublica_search(name: str) -> dict:
+    """ProPublica Nonprofit Explorer: find US nonprofits by name (IRS data, free)."""
+    return cached_get("https://projects.propublica.org/nonprofits/api/v2/search.json", {"q": name})
+
+
+def propublica_org(ein) -> dict:
+    """ProPublica Nonprofit Explorer: one nonprofit's IRS Form 990 filings."""
+    return cached_get(f"https://projects.propublica.org/nonprofits/api/v2/organizations/{ein}.json")
 
 
 def list_endpoints() -> dict:

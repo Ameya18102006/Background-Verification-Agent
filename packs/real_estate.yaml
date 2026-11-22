@@ -1,0 +1,50 @@
+# Check pack: buying or renting property (the property / project, its developer, its owner).
+# Uses both bases, all optional: fill whichever you know. The developer company is the gate
+# when given; otherwise the owner/landlord.
+name: real_estate
+label: Buying or renting property
+subject: property
+extends: [base_company, base_person]
+description: Before buying a flat or plot, booking in a project, or renting from a landlord,
+  check the developer, the owner, and the property itself for disputes, delays and fraud.
+
+inputs:
+  - {key: property, label: "Project or property name / address", required: true}
+  - {key: company, label: "Developer / builder company (optional)", required: false}
+  - {key: name, label: "Owner or landlord name (optional)", required: false}
+
+checks:
+  - {id: person, tier: 1}           # the owner/landlord (skipped if no name)
+  - id: property_disputes
+    label: Disputes, delays and complaints about the property
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{property}" possession delay', category: delay}
+        - {q: '"{property}" RERA complaint', category: regulatory}
+        - {q: '"{property}" demolition OR illegal construction', category: legality}
+  - id: property_courts
+    label: Court records about the property (Indian Kanoon)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{property}"', site: indiankanoon.org, category: litigation}
+
+red_flags:
+  - {id: title_dispute, tier: 1, description: "Ownership, title or land dispute in court"}
+  - {id: illegal_construction, tier: 1, description: "Demolition order, unapproved plan or illegal construction"}
+  - {id: legal_trouble, tier: 1, description: "Developer insolvency, bankruptcy or buyer lawsuits"}
+  - {id: rera_complaints, tier: 1, description: "RERA complaints or orders against the project/developer"}
+  - {id: possession_delay, tier: 2, description: "Project years behind its promised possession date"}
+  - {id: landlord_fraud, tier: 1, description: "Owner/landlord linked to fraud or rental scams"}
+
+not_checked:
+  - Land records and title chain (state land registry)
+  - Encumbrance certificate / liens and mortgages on the property
+  - Building approvals, occupancy certificate (OC)
+  - Property tax dues
+
+demo:
+  property: Supertech Emerald Court
+  company: Supertech
+  domain: supertechlimited.com

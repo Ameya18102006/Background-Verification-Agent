@@ -14,3 +14,7 @@ Combine severity with confidence. A weak source such as reviews should never out
 The site filter isn't reliable: the Indian Kanoon hits are real judgments, but the sebi.gov.in and sec.gov searches returned Reddit threads and review pages labelled as official. I'm testing how to detect that kind of mislabeling next.
 
 Score = severity × how much this flag matters in this domain (tier) × source reliability (official record > data-provider record > news > web page).
+
+adding inheritance to the domain packs in agent.py, so each pack extends base_person or base_company and can add, override or skip checks by id.
+
+Name match not reliable
