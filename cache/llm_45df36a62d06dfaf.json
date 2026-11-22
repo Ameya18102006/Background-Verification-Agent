@@ -1,0 +1,33 @@
+{
+  "checks": [
+    {
+      "claim": "identity",
+      "claimed": "Aarav Mehta",
+      "found": "Aarav Mehta",
+      "status": "match",
+      "explanation": "The claimed name matches the profile data."
+    },
+    {
+      "claim": "company",
+      "claimed": "Nimbus Analytics",
+      "found": "Nimbus Analytics",
+      "status": "match",
+      "explanation": "The claimed company matches the profile data."
+    },
+    {
+      "claim": "role",
+      "claimed": "Senior Data Scientist",
+      "found": "Data Scientist, Data Analyst",
+      "status": "partial",
+      "explanation": "The candidate claimed Senior Data Scientist, but profile data shows titles of Data Scientist and Data Analyst at the company."
+    },
+    {
+      "claim": "years",
+      "claimed": "4.0",
+      "found": "4.4 years",
+      "status": "match",
+      "explanation": "The total calculated tenure at Nimbus Analytics is 4.4 years, which is within 0.5 years of the claimed 4.0 years."
+    }
+  ],
+  "summary": "Identity, company, and tenure years matched the profile data. Role is a partial match due to seniority level differences."
+}

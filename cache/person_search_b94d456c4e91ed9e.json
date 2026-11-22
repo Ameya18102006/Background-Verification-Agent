@@ -1,0 +1,53 @@
+{
+  "ok": true,
+  "_sample": true,
+  "data": {
+    "profiles": [
+      {
+        "crustdata_person_id": 0,
+        "basic_profile": {
+          "name": "Aarav Mehta",
+          "headline": "Data Scientist at Nimbus Analytics",
+          "current_title": "Data Scientist",
+          "location": {
+            "raw": "Bengaluru, Karnataka, India"
+          }
+        },
+        "social_handles": {
+          "professional_network_identifier": {
+            "profile_url": "https://www.linkedin.com/in/sample-aarav-mehta"
+          }
+        },
+        "experience": {
+          "employment_details": {
+            "current": [
+              {
+                "name": "Nimbus Analytics",
+                "title": "Data Scientist",
+                "start_date": "2023-06-01",
+                "end_date": null
+              }
+            ],
+            "past": [
+              {
+                "name": "Nimbus Analytics",
+                "title": "Data Analyst",
+                "start_date": "2022-07-01",
+                "end_date": "2023-05-31"
+              },
+              {
+                "name": "Orbit Retail",
+                "title": "Business Analyst Intern",
+                "start_date": "2022-01-01",
+                "end_date": "2022-06-30"
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "next_cursor": null,
+    "total_count": 1
+  },
+  "credits_used": null
+}

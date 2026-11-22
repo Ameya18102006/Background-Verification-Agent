@@ -1,0 +1,65 @@
+../.bash_history
+../.cache/
+../.copilot/
+../.gitconfig
+../.gitignore
+../.idlerc/
+../.ipython/
+../.jupyter/
+../.lesshst
+../.local/
+../.matplotlib/
+../.minttyrc
+../.python-version
+../.python_history
+../.ssh/
+../.uppaal/
+../.viminfo
+../.vscode-shared/
+../.vscode/
+../AppData/
+./
+../Bkp_02-06-26/
+../Bkp_31-05-26/
+../CodeForces_Practice/
+../Contacts/
+../Data Structures Implementation/
+../Documents/
+../Downloads/
+../Favorites/
+../FlightSearchAgent/
+../IntelGraphicsProfiles/
+../Learn Flask/
+../Links/
+../Machine Learning/
+../Music/
+../MyFirstGitFolder/
+../NTUSER.DAT
+../NTUSER.DAT{ca9b2b78-f3bf-11ef-a985-d30ab5ee442a}.TM.blf
+../NTUSER.DAT{ca9b2b78-f3bf-11ef-a985-d30ab5ee442a}.TMContainer00000000000000000001.regtrans-ms
+../NTUSER.DAT{ca9b2b78-f3bf-11ef-a985-d30ab5ee442a}.TMContainer00000000000000000002.regtrans-ms
+../OneDrive/
+../PDF-Parsing-Agent/
+../PDF_Parser_Master_02-06-26/
+../PDF_Parsing_Agent_1/
+../README.md
+../RE_do/
+../Saved Games/
+../Searches/
+../Travel-assistant-AI-agent/
+../Videos/
+../dbproxy/
+../dbproxy_bkp/
+../main.py
+../new_ssh
+../new_ssh.pub
+../ntuser.dat.LOG1
+../ntuser.dat.LOG2
+../ntuser.ini
+../pipx/
+../pyproject.toml
+../uv.lock
+
+# Project secrets and cache
+config.py
+__pycache__/

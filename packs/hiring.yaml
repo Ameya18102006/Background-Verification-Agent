@@ -1,0 +1,6 @@
+# Check pack: hiring (Level 1 uses this list implicitly; Level 3 will load it)
+name: hiring
+description: Pre-screen a job candidate's career claims.
+inputs: [name, company, role, years]
+checks: [person_profile]
+output: claim_vs_reality
