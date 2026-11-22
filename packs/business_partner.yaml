@@ -1,4 +1,5 @@
 # Check pack: doing a business deal with a person (co-founder, partner, investor, distributor).
+# For partnerships, links to failed ventures matter as much as legal trouble: Tier 1.
 name: business_partner
 label: Business deal with a person
 subject: person
@@ -15,34 +16,56 @@ inputs:
 checks:
   - id: person
     tool: person_profile
+    gate: true
     params: {name: "{name}", company: "{company}", linkedin_url: "{linkedin_url}"}
-  - id: their_company
-    label: Their company's health
-    tool: company_profile
-    params: {name: "{company|person.current_company}", domain: "{domain}"}
-  - id: news
-    label: Adverse news (person and company)
+  - id: sanctions
+    tool: sanctions_screen
+    params: {names: ["{person.name|name}", "{company.name|company}"]}
+  - id: adverse_news
+    label: Fraud and insolvency news
     tool: web_search
     params:
       queries:
-        - '"{person.name|name}" fraud'
-        - '"{person.name|name}" court case'
-        - '"{company.name|company}" insolvency'
+        - {q: '"{person.name|name}" fraud', category: adverse_media}
+        - {q: '"{company.name|company}" fraud', category: adverse_media}
+        - {q: '"{company.name|company}" insolvency', category: insolvency}
+  - id: court_records
+    label: Court records (Indian Kanoon)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{person.name|name}"', site: indiankanoon.org, category: litigation}
+        - {q: '"{company.name|company}"', site: indiankanoon.org, category: litigation}
+  - id: regulatory
+    label: Regulator orders (SEBI)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{person.name|name}"', site: sebi.gov.in, category: regulatory}
+        - {q: '"{company.name|company}"', site: sebi.gov.in, category: regulatory}
+  - id: their_company
+    label: Their company's status and health
+    tool: company_profile
+    params: {name: "{company|person.current_company}", domain: "{domain}"}
 
 red_flags:
-  - {id: failed_ventures, description: "Past companies they led are closed or shrank sharply"}
-  - {id: company_decline, description: "Their company's headcount dropped sharply from its peak"}
-  - {id: funding_stall, description: "No funding for a long time while headcount falls"}
-  - {id: legal_trouble, description: "News of lawsuits, court cases, insolvency or regulator action"}
-  - {id: fraud_allegations, description: "News linking them to fraud, scams or misleading investors"}
-  - {id: claim_mismatch, description: "What they told you contradicts the evidence"}
-  - {id: identity_unclear, description: "No profile found, or several people match equally"}
+  - {id: sanctions, tier: 1, description: "Person or company matches a sanctions list"}
+  - {id: identity_unclear, tier: 1, description: "No profile found, or several people match equally"}
+  - {id: fraud_allegations, tier: 1, description: "News linking them to fraud, scams or misleading investors"}
+  - {id: legal_trouble, tier: 1, description: "Lawsuits, court judgments, insolvency or bankruptcy"}
+  - {id: regulatory_action, tier: 1, description: "Regulator orders, penalties or bans (SEBI etc.)"}
+  - {id: failed_ventures, tier: 1, description: "Companies they led have deleted pages, collapsed headcount or shut down"}
+  - {id: company_decline, tier: 2, description: "Their company's headcount dropped sharply from its peak"}
+  - {id: company_status, tier: 2, description: "Their company is inactive, or very new while claiming a big track record"}
+  - {id: claim_mismatch, tier: 2, description: "What they told you contradicts the evidence"}
+  - {id: funding_stall, tier: 3, description: "No funding for a long time while headcount falls"}
 
 not_checked:
-  - Criminal records
-  - Personal credit and debts
-  - Company financial statements and tax filings
-  - Ownership and shareholding records
+  - Politically exposed person (PEP) lists
+  - Police and criminal records
+  - Personal credit, debts and tax liens
+  - Company financial statements
+  - Official director and shareholding records (MCA)
 
 demo:
   name: Byju Raveendran

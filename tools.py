@@ -95,6 +95,7 @@ PERSON_FIELDS = [
     "social_handles.professional_network_identifier.profile_url",
     "experience.employment_details.current",
     "experience.employment_details.past",
+    "education",          # +0.1 credit/result: lets us check education claims
 ]
 
 COMPANY_FIELDS = ["basic_info", "headcount", "funding", "employee_reviews", "news"]
@@ -133,9 +134,20 @@ def company_enrich(name: str = "", domain: str = "") -> dict:
     return crustdata_post("/company/enrich", body)
 
 
-def web_search(query: str, sources=("news",)) -> dict:
-    """/web/search/live. 1 credit per call. Keep queries simple: quoted name + one keyword."""
-    return crustdata_post("/web/search/live", {"query": query, "sources": list(sources)})
+def company_people(name: str = "", domain: str = "") -> dict:
+    """/company/enrich with only the 'people' group (founders, CXOs). ~6 credits."""
+    body = {"domains": [domain]} if domain else {"names": [name]}
+    body["fields"] = ["people"]
+    return crustdata_post("/company/enrich", body)
+
+
+def web_search(query: str, sources=("news",), site: str = None) -> dict:
+    """/web/search/live. 1 credit per call. Keep queries simple: quoted name + one keyword.
+    site="indiankanoon.org" restricts results to that website."""
+    body = {"query": query, "sources": list(sources)}
+    if site:
+        body["site"] = site
+    return crustdata_post("/web/search/live", body)
 
 
 def list_endpoints() -> dict:

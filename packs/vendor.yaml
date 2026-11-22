@@ -1,9 +1,10 @@
 # Check pack: choosing a vendor / supplier / service provider (a company).
+# For a vendor, whether the company is real and alive is the gate: company_profile is Tier 1.
 name: vendor
 label: Choosing a vendor or supplier
 subject: company
 description: Before signing a contract or paying an advance to a company, check that it is
-  real, stable, and not in the news for the wrong reasons.
+  real, alive, not sanctioned, and not in the news for the wrong reasons.
 
 inputs:
   - {key: company, label: "Company name", required: true}
@@ -13,30 +14,56 @@ inputs:
 checks:
   - id: company
     tool: company_profile
+    tier: 1
+    gate: true
     params: {name: "{company}", domain: "{domain}"}
-  - id: news
-    label: Adverse news about the company
+  - id: sanctions
+    tool: sanctions_screen
+    params: {names: ["{company.name|company}", "{company}"]}
+  - id: adverse_news
+    label: Fraud, lawsuit and bankruptcy news
     tool: web_search
     params:
       queries:
-        - '"{company.name|company}" fraud'
-        - '"{company.name|company}" lawsuit'
-        - '"{company.name|company}" layoffs'
+        - {q: '"{company.name|company}" fraud', category: adverse_media}
+        - {q: '"{company.name|company}" lawsuit', category: litigation}
+        - {q: '"{company.name|company}" bankruptcy', category: insolvency}
+  - id: court_records
+    label: Court records (Indian Kanoon)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}"', site: indiankanoon.org, category: litigation}
+  - id: regulatory
+    label: Regulator actions (SEBI, US SEC)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{company.name|company}"', site: sebi.gov.in, category: regulatory}
+        - {q: '"{company.name|company}"', site: sec.gov, category: regulatory}
+  - id: leaders
+    label: Founders and their past ventures
+    tool: key_people
+    params: {name: "{company.name|company}", domain: "{domain|company.domain}"}
 
 red_flags:
-  - {id: not_found, description: "No company record found, or a different company matches"}
-  - {id: very_new, description: "Founded very recently or tiny team for the size of the contract"}
-  - {id: shrinking, description: "Headcount dropped sharply from its peak"}
-  - {id: inactive, description: "Company status is closed, acquired or inactive"}
-  - {id: legal_trouble, description: "Lawsuits, insolvency, regulator action or unpaid suppliers"}
-  - {id: fraud_allegations, description: "News of fraud or misleading customers or investors"}
-  - {id: poor_reviews, description: "Very low employee rating"}
-  - {id: claim_mismatch, description: "Vendor's claims (size, age, clients) contradict the evidence"}
+  - {id: sanctions, tier: 1, description: "Company matches a sanctions list"}
+  - {id: not_found, tier: 1, description: "No company record found, or a different company matches"}
+  - {id: inactive, tier: 1, description: "Company status is closed, acquired, dissolved or inactive"}
+  - {id: fraud_allegations, tier: 1, description: "News of fraud or misleading customers or investors"}
+  - {id: legal_trouble, tier: 1, description: "Lawsuits, court judgments, insolvency or bankruptcy"}
+  - {id: regulatory_action, tier: 1, description: "Regulator orders, penalties or bans"}
+  - {id: very_new, tier: 2, description: "Founded under 2 years ago, or tiny team for the size of the contract"}
+  - {id: shrinking, tier: 2, description: "Headcount dropped sharply from its peak"}
+  - {id: phoenix_pattern, tier: 2, description: "Founders previously led companies that collapsed or vanished"}
+  - {id: claim_mismatch, tier: 2, description: "Vendor's claims (size, age, stability, clients) contradict the evidence"}
+  - {id: poor_reviews, tier: 3, description: "Very low employee rating"}
 
 not_checked:
+  - GST and tax registration status
   - Financial statements and credit rating
-  - GST / tax registration status
-  - Court records
+  - Tax liens and unpaid supplier debts
+  - Official director and shareholding records (MCA)
   - Customer references
 
 demo:

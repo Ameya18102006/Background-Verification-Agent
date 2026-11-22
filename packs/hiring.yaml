@@ -1,6 +1,8 @@
 # Check pack: hiring a candidate.
 # Placeholders: {input_key} from the form, {a|b} = first non-empty,
-# {person.current_company} etc. = values found by an earlier check.
+# {person.name}, {person.current_company}, {company.name} = found by an earlier check.
+# tier: 1 = deal-breaker checks (run first), 2 = high-value signals, 3 = minor.
+# gate: true = this check confirms identity; everything else depends on it.
 name: hiring
 label: Hiring a candidate
 subject: person
@@ -11,37 +13,51 @@ inputs:
   - {key: name, label: "Candidate full name", required: true}
   - {key: company, label: "Current or last employer"}
   - {key: linkedin_url, label: "LinkedIn URL (optional, most accurate)"}
-  - {key: claims, label: "What the candidate claims (optional), e.g. 'Senior Data Scientist at X, 4 years'", type: text}
+  - {key: claims, label: "What the candidate claims (optional), e.g. 'Senior Data Scientist at X, 4 years, B.Tech IIT Delhi'", type: text}
 
 checks:
   - id: candidate
     tool: person_profile
+    gate: true
     params: {name: "{name}", company: "{company}", linkedin_url: "{linkedin_url}"}
+  - id: sanctions
+    tool: sanctions_screen
+    params: {names: ["{person.name|name}"]}
+  - id: adverse_news
+    label: Fraud and misconduct news
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{person.name|name}" fraud', category: adverse_media}
+        - {q: '"{person.name|name}" arrested', category: adverse_media}
+  - id: court_records
+    label: Court records (Indian Kanoon)
+    tool: web_search
+    params:
+      queries:
+        - {q: '"{person.name|name}"', site: indiankanoon.org, category: litigation}
   - id: employer
     label: Current employer profile
     tool: company_profile
     params: {name: "{person.current_company|company}"}
-  - id: news
-    label: Adverse news about the candidate
-    tool: web_search
-    params:
-      queries:
-        - '"{person.name|name}" fraud'
-        - '"{person.name|name}" arrested'
 
+# tier here = how much this kind of flag weighs in the risk score for THIS domain.
 red_flags:
-  - {id: claim_mismatch, description: "Claimed company, title or years differ from the profile"}
-  - {id: job_hopping, description: "Several jobs shorter than one year"}
-  - {id: unexplained_gap, description: "Employment gap over 6 months"}
-  - {id: shell_employer, description: "A claimed employer is tiny, closed, or cannot be found"}
-  - {id: adverse_media, description: "News linking the person to fraud, harassment, arrest or misconduct"}
-  - {id: identity_unclear, description: "No profile found, or several people match equally"}
+  - {id: sanctions, tier: 1, description: "Name matches a sanctions list"}
+  - {id: identity_unclear, tier: 1, description: "No profile found, or several people match equally"}
+  - {id: claim_mismatch, tier: 1, description: "Claimed company, title, years or degree differ from the profile"}
+  - {id: adverse_media, tier: 1, description: "News linking the person to fraud, harassment, arrest or misconduct"}
+  - {id: litigation, tier: 1, description: "Court judgment naming the person as accused or defendant"}
+  - {id: shell_employer, tier: 2, description: "A claimed employer is tiny, deleted, very new or cannot be found"}
+  - {id: job_hopping, tier: 3, description: "Several jobs shorter than one year"}
+  - {id: unexplained_gap, tier: 3, description: "Employment gap over 6 months"}
 
 not_checked:
-  - Criminal records and court cases
-  - Education certificates
+  - Politically exposed person (PEP) lists
+  - Police and criminal records
+  - Professional license status
+  - Original education certificates
   - Reference calls with past managers
-  - Identity documents
 
 demo:
   name: Satya Nadella

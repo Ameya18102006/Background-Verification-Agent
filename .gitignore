@@ -61,6 +61,7 @@
 ../uv.lock
 
 .claude/
+cache
 cache/company_enrich_2ac45be38165a7fd.json
 cache/company_enrich_3e51679cc40c3a5a.json
 cache/company_enrich_84156652e6cccfd8.json

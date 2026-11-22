@@ -1,35 +1,62 @@
 """
 checks.py - the registry of reusable checks.
 
-A check = one kind of data fetch (one tool call) + turning the raw JSON into
-small, LLM-friendly FACTS plus a list of SOURCES (title + url) that red flags
-can cite. Checks know nothing about hiring vs. business deals: the YAML pack
-decides which checks run, with which inputs, and what counts as a red flag.
+A check = one kind of data fetch + turning raw data into small, LLM-friendly
+FACTS plus SOURCES (title + url + how reliable the source is). Checks know
+nothing about hiring vs. vendors: the YAML pack decides which checks run, with
+which inputs, at which tier, and what counts as a red flag.
 
 Adding a new kind of data = write one function here and add it to CHECKS.
-Adding a new domain (used cars, landlords, ...) = write a new YAML pack only.
+Adding a new domain = write a new YAML pack only.
 
 Every check returns an Evidence dict:
-  status   : "ok" | "empty" (nothing found) | "error"
-  facts    : dict of compact facts for the LLM
-  sources  : [{"title", "url", "snippet"}]   (agent.py gives them ids S1, S2...)
-  context  : values later checks can reuse, e.g. {"person.current_company": "Acme"}
-  credits  : credits spent (None when cached)
-  error    : message when status == "error"
+  status       : "ok" | "empty" (nothing found) | "error"
+  facts        : dict of compact facts for the LLM
+  sources      : [{"title", "url", "snippet", "reliability"}]   (agent.py adds ids S1, S2...)
+  context      : values later checks can reuse, e.g. {"person.current_company": "Acme"}
+  identity     : (gate checks only) {"confidence": high|medium|low|not_found, "reasons": [...]}
+  deal_breaker : None, or a short reason when the check found a stop-everything hit
+  credits      : credits spent (None when cached)
+  error        : message when status == "error"
+
+Source reliability (used to weight red flags, so a weak source never outranks
+an official record):
+  official : government list, court or regulator website
+  record   : structured data-provider record (Crustdata profile / company record)
+  news     : news article
+  web      : any other web page (blogs, forums, reviews)
 """
 
+import csv
+import re
 from datetime import date
+from difflib import SequenceMatcher
+from functools import lru_cache
+from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import tools
 
+# Websites whose pages are official records (courts, regulators, governments).
+OFFICIAL_SITES = {
+    "indiankanoon.org", "sebi.gov.in", "rbi.org.in", "mca.gov.in", "sec.gov",
+    "justice.gov", "fca.org.uk", "find-and-update.company-information.service.gov.uk",
+}
 
-def _evidence(status="ok", facts=None, sources=None, context=None, result=None, error=None):
+LEADERSHIP_WORDS = ("founder", "co-founder", "ceo", "chief executive", "director",
+                    "owner", "managing partner", "proprietor", "president", "chairman")
+
+
+def _evidence(status="ok", facts=None, sources=None, context=None, result=None, error=None,
+              identity=None, deal_breaker=None):
     return {
         "status": status,
         "facts": facts or {},
         "sources": sources or [],
         "context": context or {},
+        "identity": identity,
+        "deal_breaker": deal_breaker,
         "credits": None if not result or result.get("from_cache") else result.get("credits_used"),
         "from_cache": bool(result and result.get("from_cache")),
         "error": error,
@@ -37,7 +64,7 @@ def _evidence(status="ok", facts=None, sources=None, context=None, result=None, 
 
 
 # ---------------------------------------------------------------------------
-# Small date helpers (we do date maths in code, never in the LLM)
+# Small helpers (date maths and name matching happen in code, never in the LLM)
 # ---------------------------------------------------------------------------
 
 def _parse_date(value) -> Optional[date]:
@@ -62,8 +89,33 @@ def _years(start: Optional[date], end: Optional[date]) -> Optional[float]:
     return round(((end or date.today()) - start).days / 365.25, 1)
 
 
+def normalize_name(name: str) -> str:
+    """'NADELLA, Satya.' -> 'nadella satya'. Drops punctuation and common company suffixes."""
+    s = re.sub(r"[^a-z0-9 ]", " ", (name or "").lower())
+    s = re.sub(r"\b(pvt|private|ltd|limited|llc|inc|corp|corporation|co|plc|sa|gmbh)\b", " ", s)
+    return " ".join(s.split())
+
+
+def name_similarity(a: str, b: str) -> float:
+    """0..1, ignores word order ('Satya Nadella' == 'NADELLA, Satya')."""
+    ta, tb = sorted(normalize_name(a).split()), sorted(normalize_name(b).split())
+    if not ta or not tb:
+        return 0.0
+    return SequenceMatcher(None, " ".join(ta), " ".join(tb)).ratio()
+
+
+def _host(url: str) -> str:
+    """'https://indiankanoon.org/doc/1/' -> 'indiankanoon.org'."""
+    return (urlparse(url or "").hostname or "").lower()
+
+
+def _is_leadership(title: str) -> bool:
+    t = (title or "").lower()
+    return any(w in t for w in LEADERSHIP_WORDS)
+
+
 # ---------------------------------------------------------------------------
-# Check: person_profile
+# Check: person_profile  (also the identity gate for person packs)
 # ---------------------------------------------------------------------------
 
 def _summarize_person(profile: dict, hint_company: str = "") -> dict:
@@ -84,19 +136,17 @@ def _summarize_person(profile: dict, hint_company: str = "") -> dict:
                 "start": str(start) if start else None,
                 "end": "present" if is_current else (str(end) if end else None),
                 "years": _years(start, None if is_current else end),
-                "company_status": job.get("company_status"),   # e.g. "active", "closed"
-                "company_headcount": job.get("company_headcount_latest"),
-                "is_primary": bool(job.get("is_default")),   # the job shown as their main one
+                "company_page_status": job.get("company_status"),  # "deleted" = page removed
+                "company_headcount_now": job.get("company_headcount_latest"),
+                "is_primary": bool(job.get("is_default")),
             })
     jobs.sort(key=lambda j: j["start"] or "", reverse=True)
 
-    # Simple signals the LLM can reason about (computed here, not guessed).
-    full_time = [j for j in jobs if j["years"] is not None]
-    short_stints = [j for j in full_time if j["years"] < 1 and j["end"] != "present"]
-    gaps = []
-    ordered = sorted([j for j in jobs if j["start"]], key=lambda j: j["start"])
-    latest_end = None
-    for j in ordered:
+    # Job-history signals, computed here (not guessed by the LLM).
+    short_stints = [j for j in jobs if j["years"] is not None and j["years"] < 1
+                    and j["end"] != "present"]
+    gaps, latest_end = [], None
+    for j in sorted([j for j in jobs if j["start"]], key=lambda j: j["start"]):
         s = _parse_date(j["start"])
         if latest_end and s and (s - latest_end).days > 180:
             gaps.append({"from": str(latest_end), "to": str(s),
@@ -105,11 +155,25 @@ def _summarize_person(profile: dict, hint_company: str = "") -> dict:
         if e and (latest_end is None or e > latest_end):
             latest_end = e
 
-    # People can hold several current roles (board seats, advisor...). Prefer the
-    # one matching the company the user typed, then the primary job, then any.
+    # Ventures they led: founder/CEO/director roles. A deleted company page or a
+    # tiny/zero headcount today can mean the venture failed (weak signal: verify).
+    leadership = [{"company": j["company"], "title": j["title"], "start": j["start"],
+                   "end": j["end"], "company_page_status": j["company_page_status"],
+                   "company_headcount_now": j["company_headcount_now"]}
+                  for j in jobs if _is_leadership(j["title"])]
+
+    education = [{"school": e.get("school") or e.get("institute_name"),
+                  "degree": e.get("degree") or e.get("degree_name"),
+                  "field": e.get("field_of_study"),
+                  "start": e.get("start_year") or e.get("start_date"),
+                  "end": e.get("end_year") or e.get("end_date")}
+                 for e in ((profile.get("education") or {}).get("schools") or [])]
+
+    # People can hold several current roles (board seats...). Prefer the one
+    # matching the company the user typed, then the primary job, then any.
     current = [j for j in jobs if j["end"] == "present"]
-    typed = (hint_company or "").lower()
-    main = (next((j for j in current if typed and typed in (j["company"] or "").lower()), None)
+    typed = normalize_name(hint_company)
+    main = (next((j for j in current if typed and typed in normalize_name(j["company"])), None)
             or next((j for j in current if j["is_primary"]), None)
             or (current[0] if current else None))
 
@@ -121,9 +185,35 @@ def _summarize_person(profile: dict, hint_company: str = "") -> dict:
         "current_company": main["company"] if main else None,
         "current_title": main["title"] if main else None,
         "jobs": jobs[:15],
+        "education": education[:5],
         "short_stints_under_1y": len(short_stints),
         "gaps_over_6_months": gaps,
+        "leadership_roles": leadership,
     }
+
+
+def _person_identity(typed_name, typed_company, linkedin_url, top, n_profiles) -> dict:
+    """How sure are we that this profile is the person the user means?"""
+    reasons = []
+    if linkedin_url:
+        return {"confidence": "high", "reasons": ["Matched the exact LinkedIn URL provided"]}
+    sim = name_similarity(typed_name, top["name"] or "")
+    reasons.append(f"Name similarity {sim:.0%} ('{typed_name}' vs '{top['name']}')")
+    company_hit = bool(typed_company) and any(
+        normalize_name(typed_company) in normalize_name(j["company"] or "") for j in top["jobs"])
+    if typed_company:
+        reasons.append(("Company found" if company_hit else "Company NOT found")
+                       + f" in job history ('{typed_company}')")
+    if n_profiles > 1:
+        reasons.append(f"{n_profiles} profiles matched the search; using the top one")
+
+    if sim >= 0.9 and company_hit and n_profiles == 1:
+        level = "high"
+    elif sim >= 0.9 and (company_hit or n_profiles == 1):
+        level = "medium"
+    else:
+        level = "low"
+    return {"confidence": level, "reasons": reasons}
 
 
 def person_profile(name: str = "", company: str = "", linkedin_url: str = "") -> dict:
@@ -132,8 +222,7 @@ def person_profile(name: str = "", company: str = "", linkedin_url: str = "") ->
         result = tools.person_identify(linkedin_url)
         if not result["ok"]:
             return _evidence("error", result=result, error=result["error"])
-        rows = result["data"] or []
-        profiles = [m["person_data"] for r in rows for m in (r.get("matches") or [])]
+        profiles = [m["person_data"] for r in (result["data"] or []) for m in (r.get("matches") or [])]
     elif name:
         result = tools.person_search(name, company)
         if not result["ok"]:
@@ -143,25 +232,28 @@ def person_profile(name: str = "", company: str = "", linkedin_url: str = "") ->
         return _evidence("error", error="Need a name or a LinkedIn URL.")
 
     if not profiles:
-        return _evidence("empty", facts={"searched_for": {"name": name, "company": company,
-                                                          "linkedin_url": linkedin_url},
-                                         "result": "not found"}, result=result)
+        return _evidence("empty", result=result,
+                         facts={"searched_for": {"name": name, "company": company,
+                                                 "linkedin_url": linkedin_url},
+                                "result": "not found"},
+                         identity={"confidence": "not_found",
+                                   "reasons": ["No professional profile matched"]})
 
     top = _summarize_person(profiles[0], company)
     facts = {**top, "matching_profiles": len(profiles)}
-    if len(profiles) > 1:   # several people share this name: identity is less certain
+    if len(profiles) > 1:
         facts["other_matches"] = [
             {"name": (p.get("basic_profile") or {}).get("name"),
-             "headline": (p.get("basic_profile") or {}).get("headline")}
-            for p in profiles[1:]]
+             "headline": (p.get("basic_profile") or {}).get("headline")} for p in profiles[1:]]
     sources = [{"title": f"Professional profile: {top['name']}", "url": top["profile_url"],
-                "snippet": top.get("headline") or ""}]
+                "snippet": top.get("headline") or "", "reliability": "record"}]
     context = {"person.name": top["name"], "person.current_company": top["current_company"]}
-    return _evidence("ok", facts, sources, context, result)
+    identity = _person_identity(name, company, linkedin_url, top, len(profiles))
+    return _evidence("ok", facts, sources, context, result, identity=identity)
 
 
 # ---------------------------------------------------------------------------
-# Check: company_profile
+# Check: company_profile  (identity gate for company packs + status/age/health)
 # ---------------------------------------------------------------------------
 
 def _headcount_signals(hc: dict) -> dict:
@@ -180,7 +272,7 @@ def _headcount_signals(hc: dict) -> dict:
 
 
 def company_profile(name: str = "", domain: str = "") -> dict:
-    """Company identity + health: headcount trend, funding, reviews, news."""
+    """Company identity + status, age, headcount trend, funding, reviews, news."""
     if not (name or domain):
         return _evidence("error", error="Need a company name or domain.")
     result = tools.company_enrich(name=name, domain=domain)
@@ -190,26 +282,32 @@ def company_profile(name: str = "", domain: str = "") -> dict:
     rows = result["data"] or []
     matches = rows[0].get("matches") if rows else []
     if not matches:
-        return _evidence("empty", facts={"searched_for": domain or name, "result": "not found"},
-                         result=result)
+        return _evidence("empty", result=result,
+                         facts={"searched_for": domain or name, "result": "not found"},
+                         identity={"confidence": "not_found",
+                                   "reasons": ["No company record matched"]})
 
     best = matches[0]
     c = best.get("company_data") or {}
     info, funding = c.get("basic_info") or {}, c.get("funding") or {}
-    reviews = c.get("employee_reviews") or {}
-    overall = (reviews.get("overall_rating") or {})
+    overall = ((c.get("employee_reviews") or {}).get("overall_rating") or {})
+    founded = info.get("year_founded")
+    age = date.today().year - founded if founded else None
+    headcount = _headcount_signals(c.get("headcount") or {})
 
     facts = {
         "name": info.get("name"),
-        "match_confidence": best.get("confidence_score"),
-        "other_candidates": len(matches) - 1,
         "domain": info.get("primary_domain"),
-        "status": info.get("status"),
-        "company_type": info.get("company_type"),
-        "year_founded": info.get("year_founded"),
-        "employee_count_range": info.get("employee_count_range"),
         "description": (info.get("description") or "")[:400],
-        "headcount": _headcount_signals(c.get("headcount") or {}),
+        "company_type": info.get("company_type"),
+        "employee_count_range": info.get("employee_count_range"),
+        # Status and age signals (computed in code):
+        "status": info.get("status"),
+        "is_active": info.get("status") in (None, "active"),
+        "year_founded": founded,
+        "age_years": age,
+        "is_young_company_under_2y": age is not None and age < 2,
+        "headcount": headcount,
         "funding": {
             "total_usd": funding.get("total_investment_usd"),
             "last_round_type": funding.get("last_round_type"),
@@ -222,37 +320,161 @@ def company_profile(name: str = "", domain: str = "") -> dict:
     }
     record_url = info.get("professional_network_url") or info.get("website")
     sources = [{"title": f"Company record: {info.get('name')}", "url": record_url,
-                "snippet": f"{info.get('company_type')}, founded {info.get('year_founded')}"}]
-    # News attached to the company record. May be noisy: the LLM judges relevance.
-    for article in (c.get("news") or [])[:8]:
+                "snippet": f"{info.get('company_type')}, founded {founded}, status {info.get('status')}",
+                "reliability": "record"}]
+    for article in (c.get("news") or [])[:8]:   # may be noisy: the LLM judges relevance
         sources.append({"title": article.get("article_title"), "url": article.get("article_url"),
                         "snippet": f"{article.get('article_publisher_name')}, "
-                                   f"{article.get('article_publish_date')}"})
+                                   f"{article.get('article_publish_date')}",
+                        "reliability": "news"})
+
+    # Identity: a domain match is exact; a name match can hit a namesake company.
+    reasons = []
+    if domain and normalize_name(domain) in normalize_name(info.get("primary_domain") or ""):
+        level = "high"
+        reasons.append(f"Website domain matched ({domain})")
+    else:
+        sim = name_similarity(name, info.get("name") or "")
+        reasons.append(f"Name similarity {sim:.0%} ('{name}' vs '{info.get('name')}')")
+        if len(matches) > 1:
+            reasons.append(f"{len(matches)} companies matched this name")
+        level = "medium" if sim >= 0.85 and len(matches) == 1 else "low"
+
     context = {"company.name": info.get("name"), "company.domain": info.get("primary_domain")}
-    return _evidence("ok", facts, sources, context, result)
+    return _evidence("ok", facts, sources, context, result,
+                     identity={"confidence": level, "reasons": reasons})
 
 
 # ---------------------------------------------------------------------------
-# Check: web_search  (adverse media, reviews, complaints... queries come from the pack)
+# Check: sanctions_screen  (official OFAC lists, stored locally, free)
 # ---------------------------------------------------------------------------
 
-def web_search(queries: list, sources_type: list = None, results_per_query: int = 5) -> dict:
-    """Run each query from the pack (1 credit each) and collect results as sources."""
-    sources, per_query, credits, errors = [], {}, 0.0, []
-    all_cached = True
-    for q in queries:
-        result = tools.web_search(q, sources_type or ["news"])
+SANCTIONS_DIR = Path(__file__).parent / "data" / "sanctions"
+OFAC_DETAILS = "https://sanctionssearch.ofac.treas.gov/Details.aspx?id={}"
+AKA = re.compile(r"a\.k\.a\.,?\s*'([^']+)'", re.I)
+
+
+@lru_cache(maxsize=1)
+def _load_sanctions() -> tuple:
+    """Load OFAC entries once: [(normalized_name, display_name, entry_id, type, program)]."""
+    entries = []
+
+    def add(name, ent, typ, prog):
+        norm = normalize_name(name)
+        if norm:
+            entries.append((norm, name.strip(), ent, typ, prog))
+
+    for fname in ("SDN.CSV", "CONS_PRIM.CSV"):   # columns: id, name, type, program, ..., remarks
+        path = SANCTIONS_DIR / fname
+        if not path.exists():
+            continue
+        for row in csv.reader(path.open(encoding="utf-8", errors="replace")):
+            if len(row) < 4:
+                continue
+            ent, name, typ, prog = row[0], row[1], row[2].strip(" -0"), row[3]
+            add(name, ent, typ, prog)
+            for alias in AKA.findall(row[-1] or ""):
+                add(alias, ent, typ, prog)
+
+    alt = SANCTIONS_DIR / "ALT.CSV"                 # columns: id, alt_id, alt_type, alt_name, ...
+    if alt.exists():
+        by_id = {e[2]: e for e in entries}
+        for row in csv.reader(alt.open(encoding="utf-8", errors="replace")):
+            if len(row) >= 4 and row[0] in by_id:
+                _, _, _, typ, prog = by_id[row[0]]
+                add(row[3], row[0], typ, prog)
+    return tuple(entries)
+
+
+def _screen(name: str, entries) -> list:
+    """Strong = same words in any order. Possible = very similar spelling."""
+    target = normalize_name(name)
+    if len(target) < 4:
+        return []
+    t_tokens = sorted(target.split())
+    hits = []
+    for norm, display, ent, typ, prog in entries:
+        if sorted(norm.split()) == t_tokens:
+            hits.append(("strong", 1.0, display, ent, typ, prog))
+        elif abs(len(norm) - len(target)) <= 4:
+            score = SequenceMatcher(None, " ".join(sorted(norm.split())), " ".join(t_tokens)).ratio()
+            if score >= 0.92:
+                hits.append(("possible", round(score, 2), display, ent, typ, prog))
+    hits.sort(key=lambda h: -h[1])
+    seen, unique = set(), []
+    for h in hits:                       # one hit per OFAC entry
+        if h[3] not in seen:
+            seen.add(h[3])
+            unique.append(h)
+    return unique[:5]
+
+
+def sanctions_screen(names: list) -> dict:
+    """Screen each name against OFAC sanctions lists. No API call, no credits."""
+    entries = _load_sanctions()
+    if not entries:
+        return _evidence("error", error="Sanctions lists not downloaded. Run: python update_sanctions.py")
+
+    results, sources, strong = {}, [], []
+    for name in dict.fromkeys(n for n in names if n):          # de-duplicate, keep order
+        hits = _screen(name, entries)
+        results[name] = [{"match": h[0], "score": h[1], "listed_name": h[2],
+                          "type": h[4] or "entity", "program": h[5]} for h in hits] or "no match"
+        for h in hits:
+            sources.append({"title": f"OFAC sanctions list: {h[2]} ({h[5]})",
+                            "url": OFAC_DETAILS.format(h[3]),
+                            "snippet": f"{h[0]} match for '{name}', score {h[1]}",
+                            "reliability": "official"})
+            if h[0] == "strong":
+                strong.append(f"'{name}' matches OFAC entry '{h[2]}' ({h[5]})")
+
+    sources.insert(0, {"title": f"OFAC sanctions lists ({len(entries):,} names and aliases screened)",
+                       "url": "https://sanctionssearch.ofac.treas.gov/",
+                       "snippet": "US Treasury SDN and consolidated lists", "reliability": "official"})
+    facts = {"screened_names": results,
+             "note": "A name match is not proof: confirm with date of birth, nationality or address."}
+    return _evidence("ok", facts, sources,
+                     deal_breaker=("; ".join(strong) if strong else None))
+
+
+# ---------------------------------------------------------------------------
+# Check: web_search  (adverse media, court records, regulator orders...)
+# Queries come from the pack. Each can target one website and has a category.
+# ---------------------------------------------------------------------------
+
+def web_search(queries: list, results_per_query: int = 5) -> dict:
+    """
+    queries: list of strings, or dicts {"q": ..., "category": ..., "site": ...}.
+    "site" restricts to one website (e.g. indiankanoon.org for court judgments);
+    results from OFFICIAL_SITES are marked as official records.
+    """
+    sources, per_query, credits, errors, all_cached = [], {}, 0.0, [], True
+    for item in queries:
+        spec = item if isinstance(item, dict) else {"q": item}
+        q, site = spec.get("q", ""), spec.get("site")
+        if not q:
+            continue
+        category = spec.get("category", "adverse_media")
+        result = tools.web_search(q, ["web"] if site else ["news"], site=site)
+        label = f"{q} [site:{site}]" if site else q
         if not result["ok"]:
             errors.append(result["error"])
             continue
         all_cached &= bool(result.get("from_cache"))
         if not result.get("from_cache"):
             credits += float(result.get("credits_used") or 0)
-        hits = (result["data"].get("results") or [])[:results_per_query]
-        per_query[q] = len(hits)
+        hits = result["data"].get("results") or []
+        if site:
+            # The search engine sometimes ignores "site" and returns general web results
+            # (blogs, reviews). Keep only results really hosted on that site.
+            hits = [h for h in hits if _host(h.get("url")).endswith(site)]
+        hits = hits[:results_per_query]
+        per_query[label] = len(hits)
+        reliability = "official" if site in OFFICIAL_SITES else ("web" if site else "news")
         for h in hits:
             sources.append({"title": h.get("title"), "url": h.get("url"),
-                            "snippet": h.get("snippet") or "", "query": q})
+                            "snippet": h.get("snippet") or "", "category": category,
+                            "reliability": reliability})
 
     if errors and not per_query:
         return _evidence("error", error="; ".join(errors))
@@ -262,18 +484,68 @@ def web_search(queries: list, sources_type: list = None, results_per_query: int 
                    sources=sources)
     ev["credits"] = None if all_cached else credits
     ev["from_cache"] = all_cached
+    if errors:
+        ev["facts"]["errors"] = errors
     return ev
 
 
 # ---------------------------------------------------------------------------
-# The registry: tool name used in YAML packs -> (function, required params, label)
+# Check: key_people  (company founders/CEOs and the ventures they led before)
+# Catches the "phoenix company" pattern: same people, new company, old failures.
+# ---------------------------------------------------------------------------
+
+def key_people(name: str = "", domain: str = "", max_people: int = 2) -> dict:
+    """Founders/CXOs of a company, then each person's leadership history."""
+    result = tools.company_people(name=name, domain=domain)
+    if not result["ok"]:
+        return _evidence("error", result=result, error=result["error"])
+    rows = result["data"] or []
+    matches = rows[0].get("matches") if rows else []
+    people = ((matches[0].get("company_data") or {}).get("people") or {}) if matches else {}
+
+    leaders = []
+    for p in (people.get("founders") or []) + (people.get("cxos") or []):
+        b = p.get("basic_profile") or {}
+        if b.get("name") and b["name"] not in [x["name"] for x in leaders]:
+            leaders.append({"name": b["name"], "title": b.get("current_title")})
+    if not leaders:
+        return _evidence("empty", result=result,
+                         facts={"result": "No founders or CXOs listed for this company"})
+
+    facts, sources, credits = {"people": []}, [], float(result.get("credits_used") or 0) \
+        if not result.get("from_cache") else 0.0
+    company_label = name or domain
+    for leader in leaders[:max_people]:
+        ev = person_profile(leader["name"], company_label)
+        credits += float(ev["credits"] or 0)
+        if ev["status"] != "ok":
+            facts["people"].append({**leader, "history": "profile not found"})
+            continue
+        f = ev["facts"]
+        facts["people"].append({**leader, "profile_name": f["name"],
+                                "leadership_roles": f["leadership_roles"],
+                                "jobs": f["jobs"][:8]})
+        sources += ev["sources"]
+    out = _evidence("ok", facts, sources, result=result)
+    out["credits"] = credits or None
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The registry: tool name used in YAML packs -> function and defaults.
+#   needs_any : at least one of these params must be filled, else the check is skipped
+#   tier      : default tier (1 = deal-breaker checks, run first). Packs can override.
 # ---------------------------------------------------------------------------
 
 CHECKS = {
-    "person_profile": {"fn": person_profile, "needs_any": ["name", "linkedin_url"],
-                       "label": "Professional profile"},
-    "company_profile": {"fn": company_profile, "needs_any": ["name", "domain"],
-                        "label": "Company profile"},
-    "web_search": {"fn": web_search, "needs_any": ["queries"],
-                   "label": "Web and news search"},
+    "person_profile":   {"fn": person_profile, "needs_any": ["name", "linkedin_url"], "tier": 1,
+                         "label": "Professional profile and identity"},
+    "company_profile":  {"fn": company_profile, "needs_any": ["name", "domain"], "tier": 2,
+                         "label": "Company status, age and health"},
+    "sanctions_screen": {"fn": sanctions_screen, "needs_any": ["names"], "tier": 1,
+                         "label": "Sanctions screening (OFAC)"},
+    "web_search":       {"fn": web_search, "needs_any": ["queries"], "tier": 1,
+                         "label": "Web and news search"},
+    "key_people":       {"fn": key_people, "needs_any": ["name", "domain"], "tier": 2,
+                         "label": "Founders and their past ventures"},
 }

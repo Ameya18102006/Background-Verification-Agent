@@ -4,16 +4,20 @@ agent.py - the pre-screen agent: Plan -> Fetch -> Analyze -> Report.
 The agent is domain-agnostic. Everything domain-specific lives in a YAML
 "check pack" in packs/ (hiring, business partner, vendor, ...):
   - which inputs to ask for
-  - which checks to run, and with which inputs
-  - which red flags matter in that domain
+  - which checks to run, with which inputs, at which tier
+  - which red flags matter in that domain, and how much (their tier)
   - what we cannot check (shown in the "Not checked" section)
 
-  1. Plan   : load the pack, fill each check's params from the user's inputs
-              (and from earlier checks), skip checks with missing inputs
-  2. Fetch  : run each check (one tool call each) -> facts + sources
+  1. Plan   : load the pack, order checks by tier (Tier 1 deal-breakers first),
+              fill each check's params from the inputs and from earlier checks
+  2. Fetch  : run each check -> facts + sources (each with a reliability level)
+              - the "gate" check confirms identity; a weak identity is flagged
+              - a deal-breaker (e.g. sanctions match) skips the remaining Tier 2+ checks
   3. Analyze: one LLM call reads ONLY the fetched evidence and lists red flags.
               Each flag must cite source ids; flags without a valid source are dropped.
-  4. Report : risk level + recommendation are computed in plain code from the flags.
+  4. Report : each flag is scored = severity x rule tier x source reliability,
+              so a weak source never outranks an official record. Risk level and
+              recommendation are computed in plain code from those scores.
 
 Golden rule: the LLM only sees data we fetched. It never answers from memory.
 """
@@ -54,7 +58,7 @@ def load_pack(name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Plan  (fill "{placeholders}" in check params)
+# Step 1: Plan  (fill "{placeholders}" in check params, order by tier)
 # ---------------------------------------------------------------------------
 
 PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
@@ -81,34 +85,56 @@ def fill(template: str, values: dict) -> str:
     return "" if missing else out.strip()
 
 
+def _fill_any(x, values):
+    """Fill a string, or every string inside a dict (e.g. {"q": ..., "site": ...})."""
+    if isinstance(x, str):
+        return fill(x, values)
+    if isinstance(x, dict):
+        filled = {k: _fill_any(v, values) for k, v in x.items()}
+        return filled if filled.get("q", "x") else None   # drop queries with missing values
+    return x
+
+
 def resolve_params(params: dict, values: dict) -> dict:
-    """Fill every param. Lists (like queries) drop items with missing values."""
+    """Fill every param. Lists (queries, names) drop items with missing values."""
     resolved = {}
     for key, raw in (params or {}).items():
         if isinstance(raw, list):
-            resolved[key] = [s for s in (fill(x, values) if isinstance(x, str) else x
-                                         for x in raw) if s]
-        elif isinstance(raw, str):
-            resolved[key] = fill(raw, values)
+            resolved[key] = [y for y in (_fill_any(x, values) for x in raw) if y]
         else:
-            resolved[key] = raw
+            resolved[key] = _fill_any(raw, values)
     return resolved
+
+
+def plan(pack: dict) -> list:
+    """Each step gets its tier (pack override, else registry default). Tier 1 runs first;
+    within a tier the pack's order is kept, so chained checks still work."""
+    steps = []
+    for i, step in enumerate(pack["checks"]):
+        spec = checks.CHECKS.get(step["tool"], {})
+        steps.append({**step, "tier": step.get("tier", spec.get("tier", 2)), "_order": i})
+    return sorted(steps, key=lambda s: (s["tier"], s["_order"]))
 
 
 # ---------------------------------------------------------------------------
 # Step 2: Fetch
 # ---------------------------------------------------------------------------
 
-def run_checks(pack: dict, inputs: dict) -> tuple[list, list]:
-    """Run the pack's checks in order. Returns (check_results, not_checked)."""
+def run_checks(pack: dict, inputs: dict) -> dict:
+    """Run the planned checks. Returns results, not_checked, identity and deal_breaker."""
     values = {k: v for k, v in inputs.items() if v not in (None, "")}
     results, not_checked = [], []
+    identity, deal_breaker = None, None
 
-    for step in pack["checks"]:
+    for step in plan(pack):
         spec = checks.CHECKS.get(step["tool"])
         label = step.get("label") or (spec["label"] if spec else step["tool"])
         if spec is None:
             not_checked.append({"item": label, "reason": f"Unknown tool '{step['tool']}'"})
+            continue
+        # Short-circuit: after a deal-breaker, skip the rest of the lower-tier checks.
+        if deal_breaker and step["tier"] > 1:
+            not_checked.append({"item": label, "reason": "Skipped: a Tier 1 deal-breaker was found"})
             continue
 
         params = resolve_params(step.get("params"), values)
@@ -117,11 +143,16 @@ def run_checks(pack: dict, inputs: dict) -> tuple[list, list]:
             continue
 
         ev = spec["fn"](**params)
-        ev.update({"id": step["id"], "label": label, "tool": step["tool"], "params": params})
+        ev.update({"id": step["id"], "label": label, "tool": step["tool"],
+                   "tier": step["tier"], "params": params})
         results.append(ev)
 
         if ev["status"] == "error":
             not_checked.append({"item": label, "reason": f"Data source error: {ev['error']}"})
+        if step.get("gate") and ev.get("identity"):
+            identity = ev["identity"]                      # the identity gate
+        if ev.get("deal_breaker") and not deal_breaker:
+            deal_breaker = {"check": label, "reason": ev["deal_breaker"]}
         # Let later checks use what this one found (e.g. the person's current company).
         values.update({k: v for k, v in ev["context"].items() if v})
 
@@ -131,7 +162,8 @@ def run_checks(pack: dict, inputs: dict) -> tuple[list, list]:
         for src in ev["sources"]:
             n += 1
             src["id"] = f"S{n}"
-    return results, not_checked
+    return {"results": results, "not_checked": not_checked,
+            "identity": identity, "deal_breaker": deal_breaker}
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +185,6 @@ class Positive(BaseModel):
 
 class Analysis(BaseModel):
     identity: str                    # who we believe the subject is, in one sentence
-    identity_confidence: Literal["high", "medium", "low", "not_found"]
     red_flags: list[RedFlag]
     positives: list[Positive]
     summary: str                     # 2-3 neutral sentences
@@ -166,33 +197,41 @@ out RED FLAGS the decision-maker should consider, using ONLY the evidence provid
 Rules:
 - Use only the EVIDENCE. Never use outside knowledge, never guess. If unsure, leave it out.
 - Every red flag and positive must cite source_ids (like "S3") taken from the evidence.
-- Web/news results may be about a different person or company with a similar name.
-  Only use a result if its title/snippet clearly refers to this subject.
-- Use the pack's red-flag list as your checklist (rule_id = its id). Flag something else
-  only if it clearly matters for this decision (rule_id = "other").
-- Severity: high = could stop the deal on its own (fraud, court case, insolvency, fake identity);
-  medium = needs a clarifying conversation; low = minor, worth knowing.
-- Missing data is NOT a red flag by itself. Say what was found, neutrally.
+- Each source has a reliability: official (government list, court, regulator) > record (data
+  provider) > news > web. Prefer official and record sources; a blog or review alone is weak.
+- Web/news/court results may be about a different person or company with a similar name.
+  Only use a result if its title/snippet clearly refers to this subject. Court and regulator
+  hits for common names need extra care: if it is not clearly this subject, leave it out.
 - News about a person's employer is NOT about the person, unless it names their own
   involvement. Do not flag a person for their company's news (and vice versa).
   If your own detail would say "this is not about the subject", do not output that flag.
-- If no profile matched the subject, identity_confidence is "not_found".
+- A sanctions "strong" match is a high-severity flag (rule_id "sanctions"); a "possible" match
+  is medium. Always add that a name match must be confirmed with other identifiers.
+  "no match" is NOT a flag: put a clean sanctions screen under positives.
+- Use the pack's red-flag checklist (rule_id = its id). Flag something else only if it
+  clearly matters for this decision (rule_id = "other").
+- Severity: high = could stop the deal on its own (sanctions, fraud, court case, insolvency,
+  fake identity); medium = needs a clarifying conversation; low = minor, worth knowing.
+- Missing data is NOT a red flag by itself. If the identity_gate says identity is low or
+  not_found, mention it in the summary instead of guessing.
 - CLAIMS: if subject_inputs has "claims", split them into individual facts (company, title,
-  start year, duration, size...) and compare EACH one to the evidence. Any contradiction,
-  even a few years' difference, is a red flag with rule_id "claim_mismatch" and severity at
-  least "medium" (the subject told you something the record does not support)."""
+  start year, duration, degree, size...) and compare EACH one to the evidence. Any
+  contradiction is a red flag with rule_id "claim_mismatch" and severity at least "medium"."""
 
 
-def _llm_payload(pack: dict, inputs: dict, results: list) -> dict:
+def _llm_payload(pack: dict, inputs: dict, fetched: dict) -> dict:
     return {
         "decision_context": pack["label"],
         "purpose": pack.get("description", ""),
         "red_flag_checklist": pack.get("red_flags", []),
         "subject_inputs": inputs,
+        "identity_gate": fetched["identity"],
+        "deal_breaker_found_by_code": fetched["deal_breaker"],
         "evidence": [
-            {"check": ev["label"], "status": ev["status"], "facts": ev["facts"],
-             "sources": [{k: s.get(k) for k in ("id", "title", "snippet")} for s in ev["sources"]]}
-            for ev in results
+            {"check": ev["label"], "tier": ev["tier"], "status": ev["status"], "facts": ev["facts"],
+             "sources": [{k: s.get(k) for k in ("id", "title", "snippet", "reliability", "category")
+                          if s.get(k)} for s in ev["sources"]]}
+            for ev in fetched["results"]
         ],
     }
 
@@ -236,23 +275,50 @@ def analyze(payload: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Step 4: Report  (risk + recommendation in plain code: predictable and explainable)
+# Step 4: Report  (scoring in plain code: predictable and explainable)
 # ---------------------------------------------------------------------------
 
+SEVERITY_POINTS = {"high": 3, "medium": 2, "low": 1}
+TIER_WEIGHT = {1: 1.5, 2: 1.0, 3: 0.6}
+RELIABILITY_WEIGHT = {"official": 1.0, "record": 0.9, "news": 0.7, "web": 0.4}
+RELIABILITY_LABEL = {"official": "Official record", "record": "Data-provider record",
+                     "news": "News report", "web": "Web page (weak)"}
+HIGH_AT, MEDIUM_AT = 3.0, 1.4      # score thresholds for the overall risk level
+
 RECOMMENDATIONS = {
-    "Low": "Looks fine. Proceed with your normal process.",
-    "Medium": "Clarify the flagged points with the subject before proceeding.",
+    "Critical": "Do not proceed until compliance or legal has reviewed the deal-breaker.",
     "High": "Order a full paid background check before proceeding.",
+    "Medium": "Clarify the flagged points with the subject before proceeding.",
+    "Low": "Looks fine. Proceed with your normal process.",
 }
 
 
-def score(red_flags: list, identity_confidence: str) -> str:
-    severities = [f["severity"] for f in red_flags]
-    if "high" in severities:
+def score_flag(flag: dict, rule_tiers: dict) -> dict:
+    """score = severity points x tier weight (from the pack) x best source reliability."""
+    best = max((f["reliability"] for f in flag["sources"]),
+               key=lambda r: RELIABILITY_WEIGHT.get(r, 0.4), default="web")
+    tier = rule_tiers.get(flag["rule_id"], 1 if flag["rule_id"] == "sanctions" else 2)
+    score = SEVERITY_POINTS[flag["severity"]] * TIER_WEIGHT.get(tier, 1.0) * RELIABILITY_WEIGHT[best]
+    return {**flag, "tier": tier, "reliability": best,
+            "confidence": RELIABILITY_LABEL[best], "score": round(score, 2)}
+
+
+def overall_risk(flags: list, identity: dict, deal_breaker: dict) -> str:
+    if deal_breaker:
+        return "Critical"
+    top = max((f["score"] for f in flags), default=0)
+    if top >= HIGH_AT:
         return "High"
-    if "medium" in severities or identity_confidence in ("low", "not_found"):
-        return "Medium"
+    if top >= MEDIUM_AT or (identity and identity["confidence"] in ("low", "not_found")):
+        return "Medium"     # an unconfirmed identity always deserves a second look
     return "Low"
+
+
+def _is_clean_sanctions_flag(flag: dict) -> bool:
+    """A sanctions flag must cite an actual list entry, not just 'the list we screened'.
+    (Stops the LLM from turning a clean screen into a flag.)"""
+    return flag["rule_id"] == "sanctions" and not any(
+        (s["title"] or "").startswith("OFAC sanctions list:") for s in flag["sources"])
 
 
 def _attach_sources(items: list, by_id: dict) -> list:
@@ -261,8 +327,9 @@ def _attach_sources(items: list, by_id: dict) -> list:
     for item in items:
         srcs = [by_id[i] for i in item.get("source_ids", []) if i in by_id]
         if srcs:
-            kept.append({**item, "sources": [{"id": s["id"], "title": s["title"], "url": s["url"]}
-                                             for s in srcs]})
+            kept.append({**item, "sources": [
+                {"id": s["id"], "title": s["title"], "url": s["url"],
+                 "reliability": s.get("reliability", "web")} for s in srcs]})
     return kept
 
 
@@ -270,28 +337,30 @@ def run(pack_name: str, inputs: dict) -> dict:
     """The whole loop. Returns one dict the UI (or CLI) can render."""
     started = time.time()
     pack = load_pack(pack_name)
-    results, not_checked = run_checks(pack, inputs)
-    not_checked += [{"item": item, "reason": "Not available in public professional data"}
-                    for item in pack.get("not_checked", [])]
+    fetched = run_checks(pack, inputs)
+    results = fetched["results"]
+    not_checked = fetched["not_checked"] + [
+        {"item": item, "reason": "Not available in the data sources we use"}
+        for item in pack.get("not_checked", [])]
 
     report = {"pack": pack["name"], "pack_label": pack["label"], "inputs": inputs,
-              "checks": results, "not_checked": not_checked}
+              "checks": results, "not_checked": not_checked,
+              "identity_gate": fetched["identity"], "deal_breaker": fetched["deal_breaker"]}
 
-    analyzed = analyze(_llm_payload(pack, inputs, results)) if results else \
+    analyzed = analyze(_llm_payload(pack, inputs, fetched)) if results else \
         {"ok": False, "error": "No checks could run. Provide more inputs."}
     if not analyzed["ok"]:
         report.update(status="error", error=analyzed["error"])
     else:
         a = analyzed["analysis"]
         by_id = {s["id"]: s for ev in results for s in ev["sources"]}
-        flags = _attach_sources(a["red_flags"], by_id)
-        order = {"high": 0, "medium": 1, "low": 2}
-        flags.sort(key=lambda f: order[f["severity"]])
-        risk = score(flags, a["identity_confidence"])
+        rule_tiers = {r["id"]: r.get("tier", 2) for r in pack.get("red_flags", [])}
+        flags = [score_flag(f, rule_tiers) for f in _attach_sources(a["red_flags"], by_id)
+                 if not _is_clean_sanctions_flag(f)]
+        flags.sort(key=lambda f: -f["score"])
+        risk = overall_risk(flags, fetched["identity"], fetched["deal_breaker"])
         report.update(
-            status="done",
-            identity=a["identity"], identity_confidence=a["identity_confidence"],
-            red_flags=flags,
+            status="done", identity=a["identity"], red_flags=flags,
             dropped_flags=len(a["red_flags"]) - len(flags),   # flags with no valid source
             positives=_attach_sources(a["positives"], by_id),
             summary=a["summary"], risk_level=risk, recommendation=RECOMMENDATIONS[risk],
