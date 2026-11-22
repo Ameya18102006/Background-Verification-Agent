@@ -1,260 +1,310 @@
 """
 agent.py - the pre-screen agent: Plan -> Fetch -> Analyze -> Report.
 
-Level 1 (hiring only):
-  Input : name, company, claimed role, claimed years at that company
-  Fetch : one Crustdata /person/search call
-  Facts : plain Python pulls the matching jobs + tenure out of the profile
-          (we do the date maths in code, not in the LLM)
-  LLM   : one Gemini call compares claim vs. facts, returns strict JSON
-  Report: per-claim match / mismatch / not found, each with a source URL
+The agent is domain-agnostic. Everything domain-specific lives in a YAML
+"check pack" in packs/ (hiring, business partner, vendor, ...):
+  - which inputs to ask for
+  - which checks to run, and with which inputs
+  - which red flags matter in that domain
+  - what we cannot check (shown in the "Not checked" section)
+
+  1. Plan   : load the pack, fill each check's params from the user's inputs
+              (and from earlier checks), skip checks with missing inputs
+  2. Fetch  : run each check (one tool call each) -> facts + sources
+  3. Analyze: one LLM call reads ONLY the fetched evidence and lists red flags.
+              Each flag must cite source ids; flags without a valid source are dropped.
+  4. Report : risk level + recommendation are computed in plain code from the flags.
 
 Golden rule: the LLM only sees data we fetched. It never answers from memory.
 """
 
-import hashlib
 import json
+import re
 import sys
-from datetime import date
-from typing import Literal, Optional
+import time
+from pathlib import Path
+from typing import Literal
 
+import yaml
 from pydantic import BaseModel
 
+import checks
 import config
 import tools
 
-MODEL = "gemini-3.5-flash"
+MODEL = "gemini-3.5-flash-lite"
+PACKS_DIR = Path(__file__).parent / "packs"
 
 
 # ---------------------------------------------------------------------------
-# Data shapes
+# Packs
 # ---------------------------------------------------------------------------
 
-class ClaimCheck(BaseModel):
-    """One line of the report: one claim and what the data says about it."""
-    claim: Literal["identity", "company", "role", "years"]
-    claimed: str
-    found: str          # what the data shows, or "not found"
-    status: Literal["match", "partial", "mismatch", "not_found"]
-    explanation: str    # one or two plain sentences
+def list_packs() -> dict:
+    """{pack_name: pack_dict} for every YAML file in packs/."""
+    packs = {}
+    for path in sorted(PACKS_DIR.glob("*.yaml")):
+        pack = yaml.safe_load(path.read_text(encoding="utf-8"))
+        packs[pack["name"]] = pack
+    return packs
 
 
-class Analysis(BaseModel):
-    """What the LLM must return (validated by the SDK)."""
-    checks: list[ClaimCheck]
-    summary: str
+def load_pack(name: str) -> dict:
+    return list_packs()[name]
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Plan
+# Step 1: Plan  (fill "{placeholders}" in check params)
 # ---------------------------------------------------------------------------
 
-def plan(claim: dict) -> list[str]:
-    """Level 1 always runs one check. Level 3 will read this from a YAML pack."""
-    return ["person_profile"]
+PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
+
+
+def fill(template: str, values: dict) -> str:
+    """
+    "{name}" -> values["name"].
+    "{company|person.current_company}" -> first non-empty of the two.
+    Returns "" if any placeholder in the template has no value.
+    """
+    missing = False
+
+    def sub(match):
+        nonlocal missing
+        for key in match.group(1).split("|"):
+            v = values.get(key.strip())
+            if v not in (None, ""):
+                return str(v)
+        missing = True
+        return ""
+
+    out = PLACEHOLDER.sub(sub, template)
+    return "" if missing else out.strip()
+
+
+def resolve_params(params: dict, values: dict) -> dict:
+    """Fill every param. Lists (like queries) drop items with missing values."""
+    resolved = {}
+    for key, raw in (params or {}).items():
+        if isinstance(raw, list):
+            resolved[key] = [s for s in (fill(x, values) if isinstance(x, str) else x
+                                         for x in raw) if s]
+        elif isinstance(raw, str):
+            resolved[key] = fill(raw, values)
+        else:
+            resolved[key] = raw
+    return resolved
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Fetch  (+ turn raw JSON into simple facts)
+# Step 2: Fetch
 # ---------------------------------------------------------------------------
 
-def _parse_date(value) -> Optional[date]:
-    """Accepts '2021-03-01', '2021-03-01T00:00:00', '2021-03' or '2021'."""
-    if not value:
-        return None
-    s = str(value)[:10]
-    for fmt_len, parts in ((10, 3), (7, 2), (4, 1)):
-        try:
-            bits = [int(x) for x in s[:fmt_len].split("-")]
-            if len(bits) == parts:
-                return date(bits[0], bits[1] if parts > 1 else 1, bits[2] if parts > 2 else 1)
-        except ValueError:
+def run_checks(pack: dict, inputs: dict) -> tuple[list, list]:
+    """Run the pack's checks in order. Returns (check_results, not_checked)."""
+    values = {k: v for k, v in inputs.items() if v not in (None, "")}
+    results, not_checked = [], []
+
+    for step in pack["checks"]:
+        spec = checks.CHECKS.get(step["tool"])
+        label = step.get("label") or (spec["label"] if spec else step["tool"])
+        if spec is None:
+            not_checked.append({"item": label, "reason": f"Unknown tool '{step['tool']}'"})
             continue
-    return None
 
+        params = resolve_params(step.get("params"), values)
+        if not any(params.get(k) for k in spec["needs_any"]):
+            not_checked.append({"item": label, "reason": "Required input not provided"})
+            continue
 
-def _years_between(start: Optional[date], end: Optional[date]) -> Optional[float]:
-    if not start:
-        return None
-    end = end or date.today()
-    return round((end - start).days / 365.25, 1)
+        ev = spec["fn"](**params)
+        ev.update({"id": step["id"], "label": label, "tool": step["tool"], "params": params})
+        results.append(ev)
 
+        if ev["status"] == "error":
+            not_checked.append({"item": label, "reason": f"Data source error: {ev['error']}"})
+        # Let later checks use what this one found (e.g. the person's current company).
+        values.update({k: v for k, v in ev["context"].items() if v})
 
-def _company_matches(job_company: str, claimed_company: str) -> bool:
-    """Loose match: 'Infosys' vs 'Infosys Limited' should count."""
-    a, b = (job_company or "").lower().strip(), claimed_company.lower().strip()
-    return bool(a and b) and (a in b or b in a)
-
-
-def extract_facts(profile: dict, claimed_company: str) -> dict:
-    """Pull out only what the comparison needs. Pure Python, no LLM."""
-    basic = profile.get("basic_profile") or {}
-    employment = (profile.get("experience") or {}).get("employment_details") or {}
-    url = (((profile.get("social_handles") or {})
-            .get("professional_network_identifier") or {}).get("profile_url"))
-
-    jobs = []
-    for bucket in ("current", "past"):
-        for job in employment.get(bucket) or []:
-            company = job.get("name") or job.get("company_name") or ""
-            start, end = _parse_date(job.get("start_date")), _parse_date(job.get("end_date"))
-            jobs.append({
-                "company": company,
-                "title": job.get("title"),
-                "start_date": str(start) if start else None,
-                "end_date": str(end) if end else ("present" if bucket == "current" else None),
-                "years": _years_between(start, end if bucket == "past" else None),
-                "is_current": bucket == "current",
-                "matches_claimed_company": _company_matches(company, claimed_company),
-            })
-
-    at_company = [j for j in jobs if j["matches_claimed_company"]]
-    total_years = round(sum(j["years"] or 0 for j in at_company), 1) if at_company else None
-
-    return {
-        "name": basic.get("name"),
-        "headline": basic.get("headline"),
-        "location": (basic.get("location") or {}).get("raw"),
-        "profile_url": url,
-        "jobs_at_claimed_company": at_company,
-        "total_years_at_claimed_company": total_years,
-        "all_jobs": jobs,
-    }
-
-
-def fetch(claim: dict) -> dict:
-    """Run the person lookup and return facts (or a clean 'not found')."""
-    result = tools.crustdata_person(claim["name"], claim["company"])
-    if not result["ok"]:
-        return {"ok": False, "error": result["error"]}
-
-    profiles = result["data"].get("profiles") or []
-    base = {"ok": True, "from_cache": result.get("from_cache"),
-            "credits_used": result.get("credits_used"),
-            "is_sample": bool(result.get("_sample")),
-            "candidates": len(profiles)}
-    if not profiles:
-        return {**base, "facts": None}
-    # Level 1: take the top hit. (Level 5 idea: let the user pick if several.)
-    return {**base, "facts": extract_facts(profiles[0], claim["company"])}
+    # Give every source a short id (S1, S2, ...) that the LLM can cite.
+    n = 0
+    for ev in results:
+        for src in ev["sources"]:
+            n += 1
+            src["id"] = f"S{n}"
+    return results, not_checked
 
 
 # ---------------------------------------------------------------------------
 # Step 3: Analyze  (one LLM call, strict JSON)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a careful background-verification analyst doing a pre-screen.
-You compare what a candidate CLAIMS against PROFILE DATA fetched from a professional-data provider.
+class RedFlag(BaseModel):
+    title: str                       # short, e.g. "Headcount down 60% from peak"
+    severity: Literal["low", "medium", "high"]
+    rule_id: str                     # id from the pack's red_flags list, or "other"
+    detail: str                      # 1-2 sentences: what the evidence shows and why it matters
+    source_ids: list[str]            # e.g. ["S3", "S5"]; must come from the evidence
+
+
+class Positive(BaseModel):
+    detail: str
+    source_ids: list[str]
+
+
+class Analysis(BaseModel):
+    identity: str                    # who we believe the subject is, in one sentence
+    identity_confidence: Literal["high", "medium", "low", "not_found"]
+    red_flags: list[RedFlag]
+    positives: list[Positive]
+    summary: str                     # 2-3 neutral sentences
+
+
+SYSTEM_PROMPT = """You are a careful due-diligence analyst doing a fast pre-screen before a decision
+(hiring someone, a business deal, choosing a vendor, ...). Your job: identify the subject and point
+out RED FLAGS the decision-maker should consider, using ONLY the evidence provided.
 
 Rules:
-- Use ONLY the profile data given. Never use outside knowledge or guess.
-- If the data does not contain something, the status is "not_found" and found is "not found".
-- Tenure numbers are already computed for you; use them, do not recompute.
-- role: "match" if the titles mean the same job (e.g. "SDE II" ~ "Software Engineer II"),
-  "partial" if same field but a different level, "mismatch" if clearly different.
-- years: "match" if within 0.5 years, "partial" if within 1.5 years, otherwise "mismatch".
-- Be neutral and factual. A mismatch is a reason to ask questions, not proof of lying.
-Return exactly one check for each of: identity, company, role, years."""
+- Use only the EVIDENCE. Never use outside knowledge, never guess. If unsure, leave it out.
+- Every red flag and positive must cite source_ids (like "S3") taken from the evidence.
+- Web/news results may be about a different person or company with a similar name.
+  Only use a result if its title/snippet clearly refers to this subject.
+- Use the pack's red-flag list as your checklist (rule_id = its id). Flag something else
+  only if it clearly matters for this decision (rule_id = "other").
+- Severity: high = could stop the deal on its own (fraud, court case, insolvency, fake identity);
+  medium = needs a clarifying conversation; low = minor, worth knowing.
+- Missing data is NOT a red flag by itself. Say what was found, neutrally.
+- News about a person's employer is NOT about the person, unless it names their own
+  involvement. Do not flag a person for their company's news (and vice versa).
+  If your own detail would say "this is not about the subject", do not output that flag.
+- If no profile matched the subject, identity_confidence is "not_found".
+- CLAIMS: if subject_inputs has "claims", split them into individual facts (company, title,
+  start year, duration, size...) and compare EACH one to the evidence. Any contradiction,
+  even a few years' difference, is a red flag with rule_id "claim_mismatch" and severity at
+  least "medium" (the subject told you something the record does not support)."""
 
 
-def _llm_cache_key(claim: dict, facts: dict) -> str:
-    raw = json.dumps({"model": MODEL, "prompt": SYSTEM_PROMPT, "claim": claim, "facts": facts},
-                     sort_keys=True)
-    return "llm_" + hashlib.sha256(raw.encode()).hexdigest()[:16]
+def _llm_payload(pack: dict, inputs: dict, results: list) -> dict:
+    return {
+        "decision_context": pack["label"],
+        "purpose": pack.get("description", ""),
+        "red_flag_checklist": pack.get("red_flags", []),
+        "subject_inputs": inputs,
+        "evidence": [
+            {"check": ev["label"], "status": ev["status"], "facts": ev["facts"],
+             "sources": [{k: s.get(k) for k in ("id", "title", "snippet")} for s in ev["sources"]]}
+            for ev in results
+        ],
+    }
 
 
-def analyze(claim: dict, facts: dict) -> dict:
-    """Ask Gemini to compare claim vs. facts. Cached to disk like API calls."""
-    key = _llm_cache_key(claim, facts)
-    cached = tools._read_cache(key)
+def analyze(payload: dict) -> dict:
+    """Ask Gemini for red flags. Cached to disk like the API calls."""
+    key = tools.cache_key("llm", {"model": MODEL, "prompt": SYSTEM_PROMPT, "payload": payload})
+    cached = tools.read_cache(key)
     if cached:
         return {"ok": True, "analysis": cached, "from_cache": True}
+    if not config.GEMINI_API_KEY:
+        return {"ok": False, "error": "GEMINI_API_KEY is empty. Add it to config.py."}
 
-    try:
-        from google import genai
-        if not config.GEMINI_API_KEY:
-            return {"ok": False, "error": "GEMINI_API_KEY is empty. Add it to config.py (see README.md)."}
-        client = genai.Client(api_key=config.GEMINI_API_KEY)
-        user_msg = ("CLAIM:\n" + json.dumps(claim, indent=2) +
-                    "\n\nPROFILE DATA:\n" + json.dumps(facts, indent=2))
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=user_msg,
-            config={
-                "system_instruction": SYSTEM_PROMPT,
-                "response_mime_type": "application/json",  # strict JSON out
-                "response_schema": Analysis,               # validated against our Pydantic model
-                "temperature": 0,                          # same input -> same verdict
-            },
-        )
-    except Exception as e:  # missing key, network, rate limit... show it, don't crash
-        return {"ok": False, "error": f"LLM call failed: {type(e).__name__}: {e}"}
+    from google import genai
+    client = genai.Client(api_key=config.GEMINI_API_KEY)
+    response, last_error = None, None
+    for attempt in range(3):   # Gemini sometimes returns 503 "high demand": wait and retry
+        try:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents="EVIDENCE PACKAGE:\n" + json.dumps(payload, indent=1, ensure_ascii=False),
+                config={
+                    "system_instruction": SYSTEM_PROMPT,
+                    "response_mime_type": "application/json",  # strict JSON out
+                    "response_schema": Analysis,               # validated against the Pydantic model
+                    "temperature": 0,                          # same input -> same answer
+                },
+            )
+            break
+        except Exception as e:  # network, rate limit, overload... retry, then show it
+            last_error = e
+            time.sleep(3 * (attempt + 1))
+    if response is None:
+        return {"ok": False, "error": f"LLM call failed: {type(last_error).__name__}: {last_error}"}
 
     if response.parsed is None:
         return {"ok": False, "error": f"LLM gave no usable answer: {(response.text or '')[:300]}"}
-
     analysis = response.parsed.model_dump()
-    tools._write_cache(key, analysis)
+    tools.write_cache(key, analysis)
     return {"ok": True, "analysis": analysis, "from_cache": False}
 
 
 # ---------------------------------------------------------------------------
-# Step 4: Report
+# Step 4: Report  (risk + recommendation in plain code: predictable and explainable)
 # ---------------------------------------------------------------------------
 
-def run(claim: dict) -> dict:
-    """The whole loop. Returns one dict the UI (or CLI) can render."""
-    report = {"claim": claim, "checks_planned": plan(claim)}
-
-    fetched = fetch(claim)
-    report["fetch"] = fetched
-    if not fetched["ok"]:
-        report["status"] = "error"
-        report["error"] = fetched["error"]
-        return report
-
-    facts = fetched["facts"]
-    if facts is None:
-        # Nothing to compare. Say so plainly - never guess.
-        report["status"] = "not_found"
-        report["checks"] = [
-            {"claim": c, "claimed": str(claim.get(k, "")), "found": "not found",
-             "status": "not_found", "explanation": "No matching professional profile was found.",
-             "source_url": None}
-            for c, k in (("identity", "name"), ("company", "company"),
-                         ("role", "role"), ("years", "years"))
-        ]
-        report["summary"] = ("No public professional profile matched this name and company. "
-                             "That is not proof of anything, but the claim could not be verified.")
-        return report
-
-    analyzed = analyze(claim, facts)
-    if not analyzed["ok"]:
-        report["status"] = "partial"   # facts are still shown in the UI
-        report["error"] = analyzed["error"]
-        return report
-
-    # Attach the source link in code, so the LLM can never invent a URL.
-    checks = analyzed["analysis"]["checks"]
-    for c in checks:
-        c["source_url"] = facts["profile_url"]
-    report["status"] = "done"
-    report["checks"] = checks
-    report["summary"] = analyzed["analysis"]["summary"]
-    report["llm_from_cache"] = analyzed["from_cache"]
-    return report
-
-
-# A fixed demo case. Its Crustdata response is saved in cache/ (see README).
-DEMO_CLAIM = {
-    "name": "Aarav Mehta",
-    "company": "Nimbus Analytics",
-    "role": "Senior Data Scientist",
-    "years": 4,
+RECOMMENDATIONS = {
+    "Low": "Looks fine. Proceed with your normal process.",
+    "Medium": "Clarify the flagged points with the subject before proceeding.",
+    "High": "Order a full paid background check before proceeding.",
 }
 
 
+def score(red_flags: list, identity_confidence: str) -> str:
+    severities = [f["severity"] for f in red_flags]
+    if "high" in severities:
+        return "High"
+    if "medium" in severities or identity_confidence in ("low", "not_found"):
+        return "Medium"
+    return "Low"
+
+
+def _attach_sources(items: list, by_id: dict) -> list:
+    """Replace source ids with real links. Drop items that cite no real source."""
+    kept = []
+    for item in items:
+        srcs = [by_id[i] for i in item.get("source_ids", []) if i in by_id]
+        if srcs:
+            kept.append({**item, "sources": [{"id": s["id"], "title": s["title"], "url": s["url"]}
+                                             for s in srcs]})
+    return kept
+
+
+def run(pack_name: str, inputs: dict) -> dict:
+    """The whole loop. Returns one dict the UI (or CLI) can render."""
+    started = time.time()
+    pack = load_pack(pack_name)
+    results, not_checked = run_checks(pack, inputs)
+    not_checked += [{"item": item, "reason": "Not available in public professional data"}
+                    for item in pack.get("not_checked", [])]
+
+    report = {"pack": pack["name"], "pack_label": pack["label"], "inputs": inputs,
+              "checks": results, "not_checked": not_checked}
+
+    analyzed = analyze(_llm_payload(pack, inputs, results)) if results else \
+        {"ok": False, "error": "No checks could run. Provide more inputs."}
+    if not analyzed["ok"]:
+        report.update(status="error", error=analyzed["error"])
+    else:
+        a = analyzed["analysis"]
+        by_id = {s["id"]: s for ev in results for s in ev["sources"]}
+        flags = _attach_sources(a["red_flags"], by_id)
+        order = {"high": 0, "medium": 1, "low": 2}
+        flags.sort(key=lambda f: order[f["severity"]])
+        risk = score(flags, a["identity_confidence"])
+        report.update(
+            status="done",
+            identity=a["identity"], identity_confidence=a["identity_confidence"],
+            red_flags=flags,
+            dropped_flags=len(a["red_flags"]) - len(flags),   # flags with no valid source
+            positives=_attach_sources(a["positives"], by_id),
+            summary=a["summary"], risk_level=risk, recommendation=RECOMMENDATIONS[risk],
+            llm_from_cache=analyzed["from_cache"])
+
+    credits = [float(ev["credits"]) for ev in results if ev.get("credits")]
+    report["stats"] = {"seconds": round(time.time() - started, 1),
+                       "credits_used": round(sum(credits), 2),
+                       "checks_run": len(results)}
+    return report
+
+
 if __name__ == "__main__":
-    # `python agent.py`  -> run the demo case and print the report as JSON
-    print(json.dumps(run(DEMO_CLAIM), indent=2, ensure_ascii=False))
-    sys.exit(0)
+    # `python agent.py [pack]` -> run that pack's demo case and print the report.
+    name = sys.argv[1] if len(sys.argv) > 1 else "hiring"
+    print(json.dumps(run(name, load_pack(name)["demo"]), indent=2, ensure_ascii=False))

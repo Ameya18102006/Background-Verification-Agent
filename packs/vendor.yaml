@@ -1,0 +1,45 @@
+# Check pack: choosing a vendor / supplier / service provider (a company).
+name: vendor
+label: Choosing a vendor or supplier
+subject: company
+description: Before signing a contract or paying an advance to a company, check that it is
+  real, stable, and not in the news for the wrong reasons.
+
+inputs:
+  - {key: company, label: "Company name", required: true}
+  - {key: domain, label: "Website domain (most accurate), e.g. acme.com"}
+  - {key: claims, label: "What the vendor claims (optional), e.g. '500 employees, founded 2010'", type: text}
+
+checks:
+  - id: company
+    tool: company_profile
+    params: {name: "{company}", domain: "{domain}"}
+  - id: news
+    label: Adverse news about the company
+    tool: web_search
+    params:
+      queries:
+        - '"{company.name|company}" fraud'
+        - '"{company.name|company}" lawsuit'
+        - '"{company.name|company}" layoffs'
+
+red_flags:
+  - {id: not_found, description: "No company record found, or a different company matches"}
+  - {id: very_new, description: "Founded very recently or tiny team for the size of the contract"}
+  - {id: shrinking, description: "Headcount dropped sharply from its peak"}
+  - {id: inactive, description: "Company status is closed, acquired or inactive"}
+  - {id: legal_trouble, description: "Lawsuits, insolvency, regulator action or unpaid suppliers"}
+  - {id: fraud_allegations, description: "News of fraud or misleading customers or investors"}
+  - {id: poor_reviews, description: "Very low employee rating"}
+  - {id: claim_mismatch, description: "Vendor's claims (size, age, clients) contradict the evidence"}
+
+not_checked:
+  - Financial statements and credit rating
+  - GST / tax registration status
+  - Court records
+  - Customer references
+
+demo:
+  company: Builder.ai
+  domain: builder.ai
+  claims: Stable AI software company with 1000+ employees

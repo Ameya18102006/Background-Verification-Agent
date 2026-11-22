@@ -1,6 +1,49 @@
-# Check pack: hiring (Level 1 uses this list implicitly; Level 3 will load it)
+# Check pack: hiring a candidate.
+# Placeholders: {input_key} from the form, {a|b} = first non-empty,
+# {person.current_company} etc. = values found by an earlier check.
 name: hiring
-description: Pre-screen a job candidate's career claims.
-inputs: [name, company, role, years]
-checks: [person_profile]
-output: claim_vs_reality
+label: Hiring a candidate
+subject: person
+description: Pre-screen a job candidate before an offer. Find their real professional
+  history and point out anything worth asking about in the interview.
+
+inputs:
+  - {key: name, label: "Candidate full name", required: true}
+  - {key: company, label: "Current or last employer"}
+  - {key: linkedin_url, label: "LinkedIn URL (optional, most accurate)"}
+  - {key: claims, label: "What the candidate claims (optional), e.g. 'Senior Data Scientist at X, 4 years'", type: text}
+
+checks:
+  - id: candidate
+    tool: person_profile
+    params: {name: "{name}", company: "{company}", linkedin_url: "{linkedin_url}"}
+  - id: employer
+    label: Current employer profile
+    tool: company_profile
+    params: {name: "{person.current_company|company}"}
+  - id: news
+    label: Adverse news about the candidate
+    tool: web_search
+    params:
+      queries:
+        - '"{person.name|name}" fraud'
+        - '"{person.name|name}" arrested'
+
+red_flags:
+  - {id: claim_mismatch, description: "Claimed company, title or years differ from the profile"}
+  - {id: job_hopping, description: "Several jobs shorter than one year"}
+  - {id: unexplained_gap, description: "Employment gap over 6 months"}
+  - {id: shell_employer, description: "A claimed employer is tiny, closed, or cannot be found"}
+  - {id: adverse_media, description: "News linking the person to fraud, harassment, arrest or misconduct"}
+  - {id: identity_unclear, description: "No profile found, or several people match equally"}
+
+not_checked:
+  - Criminal records and court cases
+  - Education certificates
+  - Reference calls with past managers
+  - Identity documents
+
+demo:
+  name: Satya Nadella
+  company: Microsoft
+  claims: CEO of Microsoft since 2010

@@ -1,11 +1,11 @@
 """
-tools.py - every call to an outside data source lives here.
+tools.py - thin wrappers around the Crustdata API. No business logic here.
 
-Each public function = one check's data fetch (one tool call per check),
-so when something breaks you know exactly where to look.
-
-Every API response is cached to disk in cache/ as JSON. The same request
-never costs credits twice, and the demo keeps working offline.
+Every successful response is cached to disk in cache/ as JSON, so the same
+request never costs credits twice and demos keep working offline.
+All functions return a dict and never raise:
+  {"ok": True,  "data": <api json>, "from_cache": bool, "credits_used": str|None}
+  {"ok": False, "error": "<readable message>"}
 """
 
 import hashlib
@@ -20,89 +20,76 @@ BASE_URL = "https://api.crustdata.com"
 API_VERSION = "2025-11-01"
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
-TIMEOUT_SECONDS = 60
+TIMEOUT_SECONDS = 90
 
 
 # ---------------------------------------------------------------------------
-# Low-level helpers
+# Cache helpers (also used by agent.py to cache LLM answers)
 # ---------------------------------------------------------------------------
 
-def _headers() -> dict:
-    """Build Crustdata auth headers. The key comes from config.py."""
-    key = config.CRUSTDATA_API_KEY
-    if not key:
-        raise RuntimeError("CRUSTDATA_API_KEY is empty. Add it to config.py (see README.md).")
-    return {
-        "authorization": f"Bearer {key}",
-        "x-api-version": API_VERSION,
-        "content-type": "application/json",
-    }
-
-
-def cache_key(endpoint: str, body: dict) -> str:
-    """Same endpoint + same body -> same file name. sort_keys keeps it stable."""
-    raw = endpoint + json.dumps(body, sort_keys=True)
+def cache_key(prefix: str, payload) -> str:
+    """Same prefix + same payload -> same file name. sort_keys keeps it stable."""
+    raw = prefix + json.dumps(payload, sort_keys=True)
     digest = hashlib.sha256(raw.encode()).hexdigest()[:16]
-    slug = endpoint.strip("/").replace("/", "_")
+    slug = prefix.strip("/").replace("/", "_")
     return f"{slug}_{digest}"
 
 
-def _read_cache(key: str):
+def read_cache(key: str):
     path = CACHE_DIR / f"{key}.json"
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
     return None
 
 
-def _write_cache(key: str, data: dict) -> None:
+def write_cache(key: str, data) -> None:
     path = CACHE_DIR / f"{key}.json"
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Low-level HTTP
+# ---------------------------------------------------------------------------
+
+def _headers() -> dict:
+    return {
+        "authorization": f"Bearer {config.CRUSTDATA_API_KEY}",
+        "x-api-version": API_VERSION,
+        "content-type": "application/json",
+    }
+
+
 def crustdata_post(endpoint: str, body: dict) -> dict:
-    """
-    POST to Crustdata with disk caching.
-
-    Always returns a dict shaped like:
-      {"ok": True,  "data": <api json>, "from_cache": bool, "credits_used": str|None}
-      {"ok": False, "error": "<readable message>"}
-    so callers never have to catch exceptions.
-    """
+    """POST to Crustdata, with disk caching. Errors are returned, not raised."""
     key = cache_key(endpoint, body)
-    cached = _read_cache(key)
+    cached = read_cache(key)
     if cached is not None:
-        cached["from_cache"] = True
-        return cached
+        return {**cached, "from_cache": True}
 
+    if not config.CRUSTDATA_API_KEY:
+        return {"ok": False, "error": "CRUSTDATA_API_KEY is empty. Add it to config.py."}
     try:
         resp = requests.post(BASE_URL + endpoint, headers=_headers(), json=body,
                              timeout=TIMEOUT_SECONDS)
-    except RuntimeError as e:          # missing API key
-        return {"ok": False, "error": str(e)}
-    except requests.RequestException as e:  # network trouble
+    except requests.RequestException as e:
         return {"ok": False, "error": f"Network error calling {endpoint}: {e}"}
 
     if resp.status_code != 200:
-        # Do NOT cache errors: a retry later might succeed.
+        # Errors are NOT cached: a retry later might succeed.
         return {"ok": False,
                 "error": f"Crustdata {endpoint} returned {resp.status_code}: {resp.text[:300]}"}
 
-    result = {
-        "ok": True,
-        "request": {"endpoint": endpoint, "body": body},
-        "data": resp.json(),
-        "credits_used": resp.headers.get("X-Credits-Used"),
-    }
-    _write_cache(key, result)
-    result["from_cache"] = False
-    return result
+    result = {"ok": True, "data": resp.json(),
+              "credits_used": resp.headers.get("X-Credits-Used")}
+    write_cache(key, result)
+    return {**result, "from_cache": False}
 
 
 # ---------------------------------------------------------------------------
-# Tools (one per check)
+# Endpoint wrappers (one function per endpoint we use)
 # ---------------------------------------------------------------------------
 
-# Only ask for the fields we use: fewer premium groups = fewer credits.
+# Only request the field groups we use: fewer premium groups = fewer credits.
 PERSON_FIELDS = [
     "basic_profile",
     "social_handles.professional_network_identifier.profile_url",
@@ -110,48 +97,53 @@ PERSON_FIELDS = [
     "experience.employment_details.past",
 ]
 
-
-def person_search_body(name: str, company: str, limit: int = 3) -> dict:
-    """
-    Request body for /person/search: the person's name AND the claimed company
-    appearing in either their current or past jobs.
-    "(.)" = case-insensitive, all words must appear (forgiving on spacing/case).
-    """
-    return {
-        "filters": {
-            "op": "and",
-            "conditions": [
-                {"field": "basic_profile.name", "type": "(.)", "value": name},
-                {
-                    "op": "or",
-                    "conditions": [
-                        {"field": "experience.employment_details.current.company_name",
-                         "type": "(.)", "value": company},
-                        {"field": "experience.employment_details.past.company_name",
-                         "type": "(.)", "value": company},
-                    ],
-                },
-            ],
-        },
-        "fields": PERSON_FIELDS,
-        "limit": limit,
-    }
+COMPANY_FIELDS = ["basic_info", "headcount", "funding", "employee_reviews", "news"]
 
 
-def crustdata_person(name: str, company: str) -> dict:
-    """
-    Check: person_profile. Find the person's professional profile.
-    Returns crustdata_post()'s dict; data["profiles"] may be an empty list.
-    """
-    return crustdata_post("/person/search", person_search_body(name, company))
+def person_search(name: str, company: str = "", limit: int = 3) -> dict:
+    """/person/search by name, optionally also by a current-or-past company.
+    "(.)" = case-insensitive, all words must appear (forgiving on spacing/case)."""
+    name_cond = {"field": "basic_profile.name", "type": "(.)", "value": name}
+    if company:
+        filters = {"op": "and", "conditions": [
+            name_cond,
+            {"op": "or", "conditions": [
+                {"field": "experience.employment_details.current.company_name",
+                 "type": "(.)", "value": company},
+                {"field": "experience.employment_details.past.company_name",
+                 "type": "(.)", "value": company},
+            ]},
+        ]}
+    else:
+        filters = name_cond
+    return crustdata_post("/person/search",
+                          {"filters": filters, "fields": PERSON_FIELDS, "limit": limit})
+
+
+def person_identify(linkedin_url: str) -> dict:
+    """/person/identify by LinkedIn URL (exact lookup, 1 credit if matched)."""
+    return crustdata_post("/person/identify",
+                          {"professional_network_profile_urls": [linkedin_url]})
+
+
+def company_enrich(name: str = "", domain: str = "") -> dict:
+    """/company/enrich by domain (preferred, exact) or by name. ~2 credits."""
+    body = {"domains": [domain]} if domain else {"names": [name]}
+    body["fields"] = COMPANY_FIELDS
+    return crustdata_post("/company/enrich", body)
+
+
+def web_search(query: str, sources=("news",)) -> dict:
+    """/web/search/live. 1 credit per call. Keep queries simple: quoted name + one keyword."""
+    return crustdata_post("/web/search/live", {"query": query, "sources": list(sources)})
 
 
 def list_endpoints() -> dict:
-    """Free call: which endpoints this API key may use. Not cached (it's free)."""
+    """Free call: which endpoints this API key may use. Not cached."""
     try:
         resp = requests.get(BASE_URL + "/account/endpoints", headers=_headers(),
                             params={"status": "enabled"}, timeout=TIMEOUT_SECONDS)
-    except (RuntimeError, requests.RequestException) as e:
+    except requests.RequestException as e:
         return {"ok": False, "error": str(e)}
     if resp.status_code != 200:
         return {"ok": False, "error": f"{resp.status_code}: {resp.text[:300]}"}

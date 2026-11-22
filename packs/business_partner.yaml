@@ -1,0 +1,50 @@
+# Check pack: doing a business deal with a person (co-founder, partner, investor, distributor).
+name: business_partner
+label: Business deal with a person
+subject: person
+description: Before partnering, co-founding, investing with or signing a deal with an
+  individual, check their track record and their company's health.
+
+inputs:
+  - {key: name, label: "Person's full name", required: true}
+  - {key: company, label: "Their company"}
+  - {key: linkedin_url, label: "LinkedIn URL (optional)"}
+  - {key: domain, label: "Company website domain (optional), e.g. acme.com"}
+  - {key: claims, label: "What they told you (optional)", type: text}
+
+checks:
+  - id: person
+    tool: person_profile
+    params: {name: "{name}", company: "{company}", linkedin_url: "{linkedin_url}"}
+  - id: their_company
+    label: Their company's health
+    tool: company_profile
+    params: {name: "{company|person.current_company}", domain: "{domain}"}
+  - id: news
+    label: Adverse news (person and company)
+    tool: web_search
+    params:
+      queries:
+        - '"{person.name|name}" fraud'
+        - '"{person.name|name}" court case'
+        - '"{company.name|company}" insolvency'
+
+red_flags:
+  - {id: failed_ventures, description: "Past companies they led are closed or shrank sharply"}
+  - {id: company_decline, description: "Their company's headcount dropped sharply from its peak"}
+  - {id: funding_stall, description: "No funding for a long time while headcount falls"}
+  - {id: legal_trouble, description: "News of lawsuits, court cases, insolvency or regulator action"}
+  - {id: fraud_allegations, description: "News linking them to fraud, scams or misleading investors"}
+  - {id: claim_mismatch, description: "What they told you contradicts the evidence"}
+  - {id: identity_unclear, description: "No profile found, or several people match equally"}
+
+not_checked:
+  - Criminal records
+  - Personal credit and debts
+  - Company financial statements and tax filings
+  - Ownership and shareholding records
+
+demo:
+  name: Byju Raveendran
+  company: BYJU'S
+  domain: byjus.com

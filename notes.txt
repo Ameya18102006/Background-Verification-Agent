@@ -1,0 +1,3 @@
+Now checks.py, the registry of reusable checks.
+To support a new domain you only write a YAML pack.
+You write Python only when a pack needs a new kind of data.

@@ -1,28 +1,54 @@
 # Instant Pre-Screen Agent
 
-Before you hire someone, a public-data check runs in about a minute and gives you a
-report with source links. It replaces the first step of a paid background check
-(₹500–₹8,000+, 2–7 days).
+Before you hire someone, sign a deal, or pay a vendor, the agent works out **who you are
+dealing with** and points out **red flags** from public data in under a minute. Every flag
+links to its source. It replaces the first step of a paid background check, which costs
+₹500–₹8,000+ and takes 2–7 days.
 
-**What it checks (Level 1):** whether a candidate's claimed company, role and years
-match their professional profile on Crustdata.
-**What it does NOT check:** criminal records, court cases, education certificates.
-Crustdata doesn't hold that data, so we never guess at it.
+It does not check criminal records, court filings or financials, because Crustdata doesn't
+hold that data. Anything we can't check is listed under **Not checked**. The agent never guesses.
 
 ## How it works
 
 ```
-Plan  ->  Fetch (Crustdata /person/search)  ->  Facts (dates/tenure in Python)
-      ->  Analyze (one Gemini call, strict JSON)  ->  Report (+ source URL per check)
+Pack (YAML) ──> Plan ──> Fetch ──> Analyze ──> Report
+                 │         │          │           │
+   fill inputs into   one tool call   one LLM call    risk + recommendation
+   each check's       per check ->    reads ONLY the  computed in code from
+   params, skip       facts + sources evidence, cites the flags
+   what's missing     (S1, S2, ...)   source ids
 ```
+
+- **The domain lives in YAML.** A pack lists the inputs to ask for, the checks to run, the
+  red flags that matter for that domain, and what's not covered. `agent.py` and `app.py`
+  never mention hiring or vendors.
+- **Checks are reusable building blocks** (`checks.py`): `person_profile`, `company_profile`
+  and `web_search`. Each one makes one tool call and returns facts plus sources.
+- **Checks can chain.** A check can use what an earlier one found, e.g.
+  `{person.current_company}` (the company found on the person's profile).
+- **No made-up sources.** Each red flag must cite source ids. Flags that cite no real
+  source are dropped in code.
+- **Date maths in code** (tenure, gaps, headcount drop from peak), so the LLM never does arithmetic.
 
 | File | What it does |
 |---|---|
-| `app.py` | Streamlit UI |
-| `agent.py` | The loop: `plan()`, `fetch()`, `extract_facts()`, `analyze()`, `run()` |
-| `tools.py` | Crustdata calls with disk caching (`cache/`) |
-| `packs/` | Check packs (YAML); used from Level 3 on |
-| `make_demo_cache.py` | Writes the offline demo case (a made-up **SAMPLE** profile) |
+| `app.py` | Streamlit UI. The form is built from the selected pack |
+| `agent.py` | Generic loop: `run_checks()`, `analyze()`, `score()`, `run()` |
+| `checks.py` | Check registry (`CHECKS`). Turns API JSON into facts + sources |
+| `tools.py` | Thin Crustdata wrappers with disk caching |
+| `config.py` | API keys (git-ignored) |
+| `packs/*.yaml` | `hiring`, `business_partner`, `vendor` |
+
+## Adding a new domain
+
+Copy a pack, change `inputs`, `checks` (with `{placeholders}`), `red_flags` and
+`not_checked`. That's all: the UI dropdown picks it up automatically.
+You only write Python when the domain needs a new *kind* of data: add one function to
+`checks.py` and register it in `CHECKS`.
+
+Placeholders: `{name}` comes from the form, `{a|b}` means the first one that isn't empty,
+and `{person.name}`, `{person.current_company}`, `{company.name}`, `{company.domain}` are
+filled by earlier checks.
 
 ## Setup (Windows PowerShell)
 
@@ -30,35 +56,34 @@ Plan  ->  Fetch (Crustdata /person/search)  ->  Facts (dates/tenure in Python)
 pip install -r requirements.txt
 ```
 
-Put your keys in `config.py` (it is in `.gitignore`, so never commit it):
-
-```python
-CRUSTDATA_API_KEY = "your-crustdata-key" or os.environ.get(...)
-GEMINI_API_KEY = "your-gemini-key" or os.environ.get(...)
-```
-
-If a key is left as `""`, the environment variable with the same name is used instead.
-Get a Gemini key at https://aistudio.google.com/apikey. The model is set by `MODEL` in `agent.py` (`gemini-3.5-flash`).
-
-See which Crustdata endpoints your key can use (this call is free):
+Put your keys in `config.py`. A key left as `""` falls back to the environment variable
+with the same name. The model is `MODEL` in `agent.py`.
 
 ```powershell
-python tools.py
+python tools.py          # free: lists the endpoints your Crustdata key can use
 ```
 
 ## Run
 
 ```powershell
-python make_demo_cache.py
 streamlit run app.py
 ```
 
-Click **Load demo case**, then **Run pre-screen**.
+Pick a pack, click **Load demo case**, tick the consent box, then click **Run pre-screen**.
+CLI version: `python agent.py business_partner` (or `hiring`, `vendor`).
 
-CLI version of the demo: `python agent.py`
+Demo cases (public figures and companies, already cached):
+- **Business partner:** Byju Raveendran / BYJU'S → High risk (insolvency, court cases, headcount down 46%)
+- **Vendor:** Builder.ai → High risk (bankruptcy, fraud allegations)
+- **Hiring:** Satya Nadella with a false claim ("CEO since 2010") → claim mismatch flagged
 
-## Credits and caching
+## Credits (approximate)
 
-- `/person/search` costs about 0.13 credits per result (basic profile + experience). We fetch up to 3 results per check.
-- Every successful response is saved in `cache/`. Repeating a query costs nothing.
-- LLM answers are cached too, so a demo you've already run once works with no network.
+| Call | Credits |
+|---|---|
+| `/person/search` (up to 3 results) | ~0.2–0.7 |
+| `/company/enrich` (basic_info, headcount, funding, reviews, news) | 2–6 |
+| `/web/search/live` (per query) | 1 |
+
+One full run costs about 5–10 credits. Repeating a query costs 0, because every API
+response and LLM answer is cached in `cache/`.

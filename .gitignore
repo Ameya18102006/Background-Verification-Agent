@@ -60,6 +60,31 @@
 ../pyproject.toml
 ../uv.lock
 
+.claude/
+cache/company_enrich_2ac45be38165a7fd.json
+cache/company_enrich_3e51679cc40c3a5a.json
+cache/company_enrich_84156652e6cccfd8.json
+cache/company_enrich_a1cf507c7d70e283.json
+cache/company_enrich_a8744c1f4308153c.json
+cache/llm_231647b7a14f98af.json
+cache/llm_39a600ebbab24c6d.json
+cache/llm_4832dff932970a4b.json
+cache/llm_ac5f87322849fe55.json
+cache/llm_c9514bf99116f0f2.json
+cache/person_search_3df354aa6b7f01d9.json
+cache/person_search_e177127ba99e8087.json
+cache/person_search_fc3de5bc14886a6e.json
+cache/web_search_live_356f359527d47233.json
+cache/web_search_live_35bc8a5b67a9b0bd.json
+cache/web_search_live_3792660820882dc9.json
+cache/web_search_live_593623ca7304015c.json
+cache/web_search_live_5b703c6b5dbdab58.json
+cache/web_search_live_72153fe863410557.json
+cache/web_search_live_862d4750ce2057fa.json
+cache/web_search_live_904f481ade4dba79.json
+cache/web_search_live_de6c48995fb77b47.json
+cache/web_search_live_e4126570bc03b30e.json
+
 # Project secrets and cache
 config.py
 __pycache__/
